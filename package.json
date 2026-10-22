@@ -1,0 +1,78 @@
+{
+  "name": "@etchydotfun/rune-pool",
+  "version": "0.1.0",
+  "description": "Etchy Rune Pools: trade real Bitcoin Runes at Solana speed from any site, wallet or bot. Pools, quotes, trades, Bitcoin-wallet orders, deposits, charts, holders, the keeper.",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./vault": {
+      "types": "./dist/vault.d.ts",
+      "import": "./dist/vault.js"
+    },
+    "./deposit": {
+      "types": "./dist/deposit.d.ts",
+      "import": "./dist/deposit.js"
+    },
+    "./wallets": {
+      "types": "./dist/wallets.d.ts",
+      "import": "./dist/wallets.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "node scripts/build.mjs",
+    "gen-idl": "node scripts/gen-idl.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@dfinity/agent": "^3.0.0",
+    "@dfinity/candid": "^3.0.0",
+    "@dfinity/principal": "^3.0.0",
+    "@scure/btc-signer": "^1.8.0"
+  },
+  "peerDependenciesMeta": {
+    "@scure/btc-signer": { "optional": true },
+    "@dfinity/agent": { "optional": true },
+    "@dfinity/candid": { "optional": true },
+    "@dfinity/principal": { "optional": true }
+  },
+  "devDependencies": {
+    "@dfinity/agent": "3.4.3",
+    "@dfinity/candid": "3.4.3",
+    "@dfinity/principal": "3.4.3",
+    "@scure/btc-signer": "1.8.1",
+    "@solana/web3.js": "1.98.0",
+    "@types/node": "24.13.6",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EtchydotFun/rune-pool.git"
+  },
+  "homepage": "https://github.com/EtchydotFun/rune-pool#readme",
+  "bugs": {
+    "url": "https://github.com/EtchydotFun/rune-pool/issues"
+  },
+  "keywords": ["bitcoin", "runes", "solana", "amm", "etchy", "wbtc"],
+  "license": "Apache-2.0"
+}
