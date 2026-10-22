@@ -22,8 +22,8 @@ import {
  *   wallets' balances, shown by their bc1p address), the curve, and Runes on
  *   their way to Bitcoin;
  * - Bitcoin holders: the Runes withdrawn to Bitcoin, by address. They come
- *   from the pool's own records of every coin of its Rune (proven on Solana,
- *   see deposits.rs), so no Rune indexer has to be trusted.
+ *   from the pool's own records of every Bitcoin output holding its Rune
+ *   (proven on Solana), so no Rune indexer has to be trusted.
  */
 export interface IndexedTrade {
   /** `signature:index` (index: the event's place in its transaction). */
@@ -83,7 +83,7 @@ export const indexFromJson = (s: string) =>
     typeof v === 'string' && /^-?\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v,
   ) as PoolIndex;
 
-/** Candle sizes, like pump.fun's chart. */
+/** Candle sizes, from 1 second to 1 day. */
 export const CANDLE_SECONDS = {
   '1s': 1,
   '5s': 5,
@@ -164,8 +164,8 @@ export interface ValueCandle {
   trades: number;
 }
 /**
- * Market-cap candles in BTC and in US dollars (pump.fun style: each candle
- * opens where the last one closed). A trade's dollars use the BTC price of
+ * Market-cap candles in BTC and in US dollars (each candle opens where the
+ * last one closed). A trade's dollars use the BTC price of
  * its time when known, else `btcUsdNow`; no dollars without either.
  */
 export function marketCapCandles(
@@ -356,7 +356,7 @@ export function subscribeTrades(
   return () => void connection.removeOnLogsListener(id).catch(() => {});
 }
 
-/** A pool's numbers for coin lists (from its trades). */
+/** A pool's numbers for Rune lists (from its trades). */
 export interface PoolStats {
   trades: number;
   volumeSats: bigint;
@@ -828,7 +828,7 @@ export function createPoolIndexer(o: {
     };
   }
 
-  /** Numbers for coin lists: 24h volume and change, ATH, last trade (from the index). */
+  /** Numbers for Rune lists: 24h volume and change, ATH, last trade (from the index). */
   async function stats(pool: PublicKey): Promise<PoolStats> {
     const ix = await index(pool);
     return poolStats(

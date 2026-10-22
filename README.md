@@ -3,13 +3,13 @@
 **Etchy Rune Pools**: an AMM for new Bitcoin Runes. Trade **real Runes at Solana speed**, from
 any site, wallet, bot or terminal.
 
-- **New coins only.** A pool exists only for a Rune launched into its own vault (the program
+- **New Runes only.** A pool exists only for a Rune launched into its own vault (the program
   checks the etching's Bitcoin proof). Pools for existing Runes are turned off for good.
-- **Every coin starts at the same market cap**, like pump.fun, but in BTC: 0.035 BTC.
+- **Every Rune starts at the same market cap**: 0.035 BTC.
 - **BTC comes in and goes out only through NEAR Intents.** Etchy holds no Bitcoin for anyone.
 
-Every Etchy coin is a real Rune on Bitcoin. Its Runes sit in a Bitcoin vault that no single
-party holds the key to. Trading happens inside the coin's pool on Solana, against WBTC, so a
+Every pool trades a real Rune on Bitcoin. Its Runes sit in a Bitcoin vault that no single
+party holds the key to. Trading happens inside the Rune's pool on Solana, against WBTC, so a
 buy or sale settles in about a second. When a holder wants the real Runes on Bitcoin, the pool
 pays them out of the vault. Runes sent back to the vault are credited to the sender after 1–2
 Bitcoin blocks, and the sender can sell them whenever.
@@ -277,7 +277,7 @@ Balances and withdrawals:
 - `cancelWithdrawal({ pool, id, signer })`: while still `pending`; Runes and fee back.
 - `closeWithdrawal({ pool, id, closer })`: once delivered; rent back to whoever paid it.
 
-Launching a coin is done on etchy.fun only.
+Launching a Rune is done on etchy.fun only.
 
 Bitcoin:
 
@@ -286,7 +286,8 @@ Bitcoin:
 - `depositInfo(pool, owner)`: where to send Runes back to the vault, and the `OP_RETURN` memo
   that credits them to `owner`. They are credited after 1–2 confirmations.
 - `@etchydotfun/rune-pool/deposit` (needs `@scure/btc-signer`): the whole deposit as ONE
-  transaction the wallet signs. `depositableCoins` (the wallet's coins the pool knows),
+  transaction the wallet signs. `depositableCoins` (the wallet's Bitcoin outputs of the Rune
+  that the pool knows),
   `depositTransaction` (a PSBT plus `signInputs` for `signPsbt`), `finishDeposit`,
   `sendDeposit`, `depositStatus`, `depositOwnerOf(bc1p)`.
 
@@ -332,7 +333,7 @@ Every trade the moment it is confirmed, two ways:
 
 A trade can come twice around a reconnect: key on `id` (`signature:index`).
 
-## Coin lists
+## Rune lists
 
 - `api.pools({ sort })`: `new`, `mcap`, `volume`, `change`, `trades` or `last`. Every pool has
   `stats`: holders, 24h trades (buys, sells, traders), 24h volume (sats and USD), 24h change,

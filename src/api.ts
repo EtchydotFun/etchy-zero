@@ -35,7 +35,7 @@ export interface ApiPool {
   vaultAddress: string | null;
   /** Unix seconds. */
   createdAt: number;
-  /** Coin-list numbers (null while the pool's trades are being read). */
+  /** Numbers for Rune lists (null while the pool's trades are being read). */
   stats: ApiPoolStats | null;
 }
 export interface ApiPoolStats {
@@ -214,7 +214,7 @@ export function createEtchyApi(baseUrl: string, f: typeof fetch = fetch) {
     };
   }
   return {
-    /** Every pool, with its coin-list numbers; `sort` biggest first (`new`: newest first). */
+    /** Every pool, with its numbers for Rune lists; `sort` biggest first (`new`: newest first). */
     pools: (o: { sort?: ApiPoolSort } = {}) =>
       call<{ pools: ApiPool[] }>(
         `/v1/pools${o.sort ? `?sort=${o.sort}` : ''}`,
