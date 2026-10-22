@@ -64,8 +64,14 @@ const NET = btc.NETWORK;
 const DUST = 546n;
 const VAULT_SATS = 546n;
 const SEQUENCE = 0xfffffffd;
-/** prove_coin_spend takes 8 known inputs at most. */
+/** Rune coins in one deposit. */
 export const MAX_DEPOSIT_COINS = 8;
+/**
+ * Inputs of one deposit, Rune and payment coins together: what the
+ * program's `prove_coin_spend` takes (every input counts). A deposit with
+ * more could never be proven: its Runes would sit at the vault, uncredited.
+ */
+export const MAX_DEPOSIT_INPUTS = 12;
 const COIN_FREE = 0;
 const POOL_ACTIVE = 1;
 type Raw = Record<string, unknown>;
@@ -94,7 +100,21 @@ function inputVbytes(address: string): number {
 }
 const outputVbytes = (script: Uint8Array) => 8 + 1 + script.length;
 
-function inputFor(key: WalletKey, c: BitcoinCoin, prevTx?: Uint8Array) {
+/** A wallet's coin as a PSBT input (for `@scure/btc-signer`'s `addInput`). */
+export interface WalletInput {
+  txid: string;
+  index: number;
+  sequence: number;
+  witnessUtxo: { script: Uint8Array; amount: bigint };
+  tapInternalKey?: Uint8Array;
+  nonWitnessUtxo?: Uint8Array;
+  redeemScript?: Uint8Array;
+}
+function inputFor(
+  key: WalletKey,
+  c: BitcoinCoin,
+  prevTx?: Uint8Array,
+): WalletInput {
   const script = scriptOf(key.address);
   if (!/^([0-9a-f]{64}|[0-9a-f]{66})$/i.test(key.publicKey))
     throw new Error(`bad public key for ${key.address}`);
@@ -125,6 +145,10 @@ function inputFor(key: WalletKey, c: BitcoinCoin, prevTx?: Uint8Array) {
     throw new Error(`the public key is not ${key.address}'s`);
   return { ...base, ...extra, redeemScript: inner.script };
 }
+/** A wallet's coin as a PSBT input (Taproot, P2WPKH or P2SH-P2WPKH), checked against its key. */
+export const walletInput = inputFor;
+/** vbytes of spending one coin at this address (signed). */
+export const walletInputVbytes = inputVbytes;
 
 const b64 = (b: Uint8Array) => {
   let s = '';
@@ -183,7 +207,8 @@ export async function buildDeposit(p: {
     vsize: number;
   } | null = null;
   let total = runeIn;
-  for (let used = 0; used <= Math.min(coins.length, 20); used++) {
+  const room = MAX_DEPOSIT_INPUTS - p.coins.length;
+  for (let used = 0; used <= Math.min(coins.length, room); used++) {
     if (used) total += coins[used - 1].sats;
     const base = fixed + used * perIn;
     const vWith = Math.ceil(base + outputVbytes(change));
@@ -210,7 +235,7 @@ export async function buildDeposit(p: {
   }
   if (!plan)
     throw new Error(
-      `not enough plain BTC at ${p.payment.address} for the miner fee`,
+      `not enough plain BTC at ${p.payment.address} for the miner fee in ${room} coin(s) (a deposit takes ${MAX_DEPOSIT_INPUTS} inputs at most)`,
     );
   const tx = new btc.Transaction({ allowUnknownOutputs: true, version: 2 });
   const signInputs: Record<string, number[]> = {};

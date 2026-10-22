@@ -24,6 +24,7 @@ export * from './api.ts';
 export * from './bitcoin.ts';
 export * from './client.ts';
 export * from './indexer.ts';
+export * from './inscription.ts';
 export * from './keeper.ts';
 export * from './keeper-chain.ts';
 export * from './math.ts';
@@ -47,6 +48,7 @@ export {
   eventsFromLogs,
   instruction,
   pda,
+  poolAddressOf,
   type ProgramEvent,
 } from './program.ts';
 export { base58, fromHex, hex } from './borsh.ts';

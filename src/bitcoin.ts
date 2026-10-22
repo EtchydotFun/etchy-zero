@@ -164,6 +164,36 @@ async function rootOf(leaf: Uint8Array, index: number, branch: Uint8Array[]) {
   return h;
 }
 
+/**
+ * btc-light `tx_shaped`: the 64 bytes `l || r` read as a transaction (one
+ * input, one output, 4 bytes of scripts). A Merkle level shaped like that
+ * could be a real 64-byte transaction posing as an inner node, so the
+ * program wants the block's depth (its coinbase's branch) for such a proof.
+ */
+export function txShaped(l: Uint8Array, r: Uint8Array): boolean {
+  const at = (i: number) => (i < 32 ? l[i] : r[i - 32]);
+  if (at(4) !== 1) return false;
+  const s = at(41);
+  return s <= 4 && at(46 + s) === 1 && at(55 + s) === 4 - s;
+}
+/** Whether a level of this branch is {@link txShaped} (btc-light `root_and_shape`). */
+export async function branchShaped(
+  leaf: Uint8Array,
+  index: number,
+  branch: Uint8Array[],
+): Promise<boolean> {
+  let h = leaf;
+  let i = index;
+  let shaped = false;
+  for (const s of branch) {
+    const [l, r] = i % 2 === 1 ? [s, h] : [h, s];
+    shaped ||= txShaped(l, r);
+    h = await sha256d(concat(l, r));
+    i = Math.floor(i / 2);
+  }
+  return shaped;
+}
+
 /** The script of a Taproot script-path spend (null: key path / not Taproot). */
 export function tapscriptOf(stack: Uint8Array[]): Uint8Array | null {
   let s = stack;
@@ -246,7 +276,28 @@ export function esplora(
       !eqBytes(await rootOf(id, index, branch), internalTxid(block.merkle_root))
     )
       throw new Error('branch does not reach the Merkle root');
-    return { txid: id, height: st.block_height, rawTx, index, branch };
+    const proof: RelayerProof = {
+      txid: id,
+      height: st.block_height,
+      rawTx,
+      index,
+      branch,
+    };
+    // About once in 2^26 a real branch looks like a forged one: the program
+    // then wants the block's depth (its coinbase and the coinbase's branch).
+    if (await branchShaped(id, index, branch)) {
+      const cb = stripWitness(
+        fromHex(
+          (
+            (await get(`/tx/${displayTxid(ids[0])}/hex`, true)) as string
+          ).trim(),
+        ),
+      );
+      if (!eqBytes(await sha256d(cb), ids[0]))
+        throw new Error('coinbase txid mismatch');
+      proof.coinbase = { rawTx: cb, branch: await merkleBranch(ids, 0) };
+    }
+    return proof;
   }
 
   return {

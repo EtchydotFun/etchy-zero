@@ -9,7 +9,9 @@
  *
  *  1. Headers: new Bitcoin block headers into the btc-relay program (from a
  *     few blocks back, so a short reorg is followed too; known ones are
- *     skipped by the program).
+ *     skipped by the program). After a reorg, from where the relay's chain
+ *     and Bitcoin's part; a branch longer than one transaction holds goes
+ *     in at once from a proof buffer (`submit_headers_from`).
  *  2. Per pool whose vault is the canister's (asked once, remembered):
  *     - a PENDING launch pool without a vault: the canister signs
  *       `open_vault` (its launch key's address), the relayer sends it;
@@ -38,6 +40,7 @@
  * Failures wait (retry later) and never repeat a canister call in a loop.
  * Pure logic: the chain, Bitcoin, the vault canister and the store are passed in.
  */
+import { displayTxid, sha256d } from './bitcoin.ts';
 import { hex } from './borsh.ts';
 import { decipherRunestone, reservedRune, type Artifact } from './runestone.ts';
 
@@ -47,6 +50,10 @@ export const M83_POOL_RELAYER_POLICY = Object.freeze({
   headerBatch: 12,
   /** Re-send this many known headers before the new ones (short reorgs). */
   reorgDepth: 6,
+  /** btc-relay's MAX_REORG: the deepest fork it takes. */
+  maxReorg: 24,
+  /** btc-relay's MAX_FROM: headers in one `submit_headers_from`. */
+  headersFromAtOnce: 64,
   minFeeRate: 1,
   /** Below the canister's own cap (100 sat/vB). */
   maxFeeRate: 50,
@@ -60,8 +67,8 @@ export const M83_POOL_RELAYER_POLICY = Object.freeze({
   depositActionsPerTick: 6,
   /** Known coins checked on Bitcoin per pool per tick (round robin). */
   coinChecksPerTick: 25,
-  /** The program's limits of `prove_coin_spend`. */
-  maxCoinInputs: 8,
+  /** The program's limits of `prove_coin_spend` (every input counts). */
+  maxCoinInputs: 12,
   maxCoinOutputs: 8,
 });
 export type M83PoolRelayerPolicy = typeof M83_POOL_RELAYER_POLICY;
@@ -97,6 +104,13 @@ export interface RelayerProof {
   rawTx: Uint8Array;
   index: number;
   branch: Uint8Array[];
+  /**
+   * The block's coinbase (no witness) and its branch, when a level of
+   * `branch` is shaped like a 64-byte transaction (bitcoin.ts
+   * `branchShaped`): the program then needs the block's depth, so the
+   * proof goes through a buffer.
+   */
+  coinbase?: { rawTx: Uint8Array; branch: Uint8Array[] };
 }
 /** A Bitcoin output the program knows holds the pool's Rune (`KnownCoin`). */
 export interface RelayerCoin {
@@ -120,7 +134,15 @@ export interface RelayerNamedProof {
 }
 export interface PoolRelayerChain {
   relayTip(): Promise<number>;
+  /** The relay's block hash at `height` (display order); null if it has none. */
+  relayHash(height: number): Promise<string | null>;
   submitHeaders(headers: Uint8Array[]): Promise<string>;
+  /**
+   * Headers in ONE instruction, more than a transaction holds (a fork
+   * deeper than about 11 blocks must win at once): written to a proof
+   * buffer, `submit_headers_from` reads them there.
+   */
+  submitHeadersFrom(headers: Uint8Array[]): Promise<string>;
   minConfirmations(): Promise<number>;
   pools(): Promise<RelayerPool[]>;
   /** Ids of the withdrawals in this batch, increasing. */
@@ -128,12 +150,15 @@ export interface PoolRelayerChain {
   activate(pool: string, proof: RelayerProof): Promise<string>;
   /** Writes the proof into a buffer, `activate_named`, closes the buffer. */
   activateNamed(pool: string, proof: RelayerNamedProof): Promise<string>;
-  /** `sweeps`: deposit coin records the transaction spends (after the withdrawals). */
+  /**
+   * `inputs`: every input of the transaction except the vault coin, in
+   * order (display txid); the program accounts for each one.
+   */
   proveVaultSpend(
     pool: string,
     proof: RelayerProof,
     ids: bigint[],
-    sweeps: string[],
+    inputs: { txid: string; vout: number }[],
   ): Promise<string>;
   /** Delivered withdrawals whose Bitcoin output is not a known coin yet. */
   unregistered(pool: string): Promise<bigint[]>;
@@ -141,11 +166,15 @@ export interface PoolRelayerChain {
   coins(pool: string): Promise<RelayerCoin[]>;
   /** This transaction was already proven for this pool (`ProvenTx`). */
   proven(pool: string, txid: string): Promise<boolean>;
-  /** `inputs`: coin record addresses; `outputs`: vouts that get Runes, increasing. */
+  /**
+   * `inputs`: EVERY input of the transaction, in order (display txid; the
+   * program counts the known ones, each once); `outputs`: vouts that get
+   * Runes, increasing.
+   */
   proveCoinSpend(
     pool: string,
     proof: RelayerProof,
-    inputs: string[],
+    inputs: { txid: string; vout: number }[],
     outputs: number[],
   ): Promise<string>;
   creditDeposit(pool: string, coin: RelayerCoin): Promise<string>;
@@ -334,19 +363,56 @@ export function createPoolRelayer(d: {
   const log = d.log ?? (() => {});
   const short = (k: string) => `${k.slice(0, 6)}..`;
 
+  /** Bitcoin's block hash at `height` (display order), from its header. */
+  async function bitcoinHash(height: number): Promise<string> {
+    const [h] = await d.bitcoin.headers(height, height);
+    return displayTxid(await sha256d(h));
+  }
+
   async function syncHeaders(): Promise<number> {
     const [tip, btcTip] = await Promise.all([
       d.chain.relayTip(),
       d.bitcoin.tip(),
     ]);
     if (btcTip <= tip) return tip;
-    const from = Math.max(1, tip - p.reorgDepth + 1);
+    // Where the relay's chain and Bitcoin's part (a reorg): the highest
+    // block both have.
+    const lowest = Math.max(1, tip - p.maxReorg);
+    let fork = tip;
+    while (fork >= lowest) {
+      const [mine, theirs] = await Promise.all([
+        d.chain.relayHash(fork),
+        bitcoinHash(fork),
+      ]);
+      if (mine !== null && mine === theirs) break;
+      fork--;
+    }
+    if (fork < lowest)
+      throw new Error(
+        `the relay's chain parts from Bitcoin's more than ${p.maxReorg} blocks back: nothing a keeper can do`,
+      );
+    const replaced = tip - fork;
+    if (replaced >= p.headerBatch) {
+      // Deeper than one transaction holds: the whole branch at once.
+      const n = Math.min(btcTip - fork, p.headersFromAtOnce);
+      if (n <= replaced) return tip; // Bitcoin's branch is not longer yet
+      const hs = await d.bitcoin.headers(fork + 1, fork + n);
+      await d.chain.submitHeadersFrom(hs);
+      const after = await d.chain.relayTip();
+      log(
+        `headers: reorg of ${replaced} block(s) from ${fork}: relay ${tip} -> ${after} (Bitcoin ${btcTip})`,
+      );
+      return after;
+    }
+    const from = Math.max(1, Math.min(fork + 1, tip - p.reorgDepth + 1));
     const to = Math.min(btcTip, tip + p.headersPerTick);
     const hs = await d.bitcoin.headers(from, to);
     for (let i = 0; i < hs.length; i += p.headerBatch)
       await d.chain.submitHeaders(hs.slice(i, i + p.headerBatch));
     const after = await d.chain.relayTip();
-    log(`headers: relay ${tip} -> ${after} (Bitcoin ${btcTip})`);
+    log(
+      `headers: relay ${tip} -> ${after} (Bitcoin ${btcTip})${replaced ? `, reorg of ${replaced} block(s)` : ''}`,
+    );
     return after;
   }
 
@@ -422,18 +488,17 @@ export function createPoolRelayer(d: {
       const proof = await d.bitcoin.prove(spent.txid);
       if (!proof) return;
       const ids = await d.chain.batchIds(pool.pool, v.batch);
-      // The deposit coins the canister swept into the vault in this spend.
+      // Every input but the vault coin (the deposits the canister swept,
+      // its fee coins): the program accounts for each one.
       const ins = txBasics(proof.rawTx).inputs;
+      const others = ins.filter(
+        (i) => !(i.txid === v.coinTxid && i.vout === v.coinVout),
+      );
       const sweeps = (await d.chain.coins(pool.pool)).filter(
         (c) =>
           c.deposit && ins.some((i) => i.txid === c.txid && i.vout === c.vout),
       );
-      const sig = await d.chain.proveVaultSpend(
-        pool.pool,
-        proof,
-        ids,
-        sweeps.map((c) => c.address),
-      );
+      const sig = await d.chain.proveVaultSpend(pool.pool, proof, ids, others);
       log(
         `${name}: batch ${v.batch} proven on Bitcoin (${spent.txid}): ${ids.length} withdrawal(s)${sweeps.length ? `, ${sweeps.length} deposit(s) swept` : ''} (${sig})`,
       );
@@ -531,8 +596,11 @@ export function createPoolRelayer(d: {
       const ins = free.filter((f) =>
         tx.inputs.some((i) => i.txid === f.txid && i.vout === f.vout),
       );
-      if (ins.length > p.maxCoinInputs) {
-        await stuck(`${ins.length} known inputs (max ${p.maxCoinInputs})`);
+      // The program takes every input (known or not), at most this many.
+      if (tx.inputs.length > p.maxCoinInputs) {
+        await stuck(
+          `${tx.inputs.length} inputs (max ${p.maxCoinInputs} in a proof)`,
+        );
         continue;
       }
       const units = ins.reduce((a, f) => a + f.runes, 0n);
@@ -552,7 +620,7 @@ export function createPoolRelayer(d: {
       const sig = await d.chain.proveCoinSpend(
         pool.pool,
         proof,
-        ins.map((f) => f.address),
+        tx.inputs,
         outs,
       );
       left--;

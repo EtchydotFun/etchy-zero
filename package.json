@@ -1,6 +1,6 @@
 {
   "name": "@etchydotfun/rune-pool",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Etchy Rune Pools: trade real Bitcoin Runes at Solana speed from any site, wallet or bot. Pools, quotes, trades, Bitcoin-wallet orders, deposits, charts, holders, the keeper.",
   "type": "module",
   "sideEffects": false,

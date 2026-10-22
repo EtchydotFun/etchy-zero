@@ -90,6 +90,29 @@ export function quoteSell(
   return { runeIn, btcFromPool: gross, fee, btcOut };
 }
 
+/**
+ * The smallest sale that pays at least `btcOut` sats (after its fee), e.g.
+ * the Runes a withdrawal sells to pay its Bitcoin fee.
+ */
+export function quoteSellExactOut(
+  p: Reserves,
+  btcOut: bigint,
+  rate: FeeRate,
+): SellQuote {
+  if (btcOut <= 0n) fail('ZeroAmount');
+  const side = btcSide(p);
+  // gross - ceil(gross * fee) >= btcOut, and floor(side * r / (rune + r)) >= gross.
+  let gross = ceilDiv(btcOut * BPS, BPS - BigInt(rate.feeBps));
+  for (let i = 0; i < 16; i++) {
+    if (gross >= side || gross > p.btcReal) fail('InsufficientLiquidity');
+    const runeIn = ceilDiv(gross * p.rune, side - gross);
+    const q = quoteSell(p, runeIn, rate);
+    if (q.btcOut >= btcOut) return q;
+    gross += btcOut - q.btcOut;
+  }
+  return fail('Overflow');
+}
+
 /** The smallest `btcIn` that buys at least `runeOut`. */
 export function quoteBuyExactOut(
   p: Reserves,

@@ -147,6 +147,16 @@ export function errorName(code: number): string | null {
 const find = (seeds: Uint8Array[], programId = PROGRAM_ID) =>
   PublicKey.findProgramAddressSync(seeds, programId)[0];
 
+/**
+ * A pool's address from its Rune ID (`block:tx`, e.g. `971505:1052`): the
+ * Rune ID is all anyone needs to find a Rune's pool (no list, no lookup).
+ */
+export function poolAddressOf(runeId: string): PublicKey {
+  const m = /^(\d{1,20}):(\d{1,10})$/.exec(runeId.trim());
+  if (!m || BigInt(m[1]) >= 1n << 64n || Number(m[2]) > 0xffffffff)
+    throw new Error(`not a Rune ID: ${runeId}`);
+  return pda.pool(BigInt(m[1]), Number(m[2]));
+}
 /** Every rune-pool address (program-derived). */
 export const pda = {
   config: () => find([enc('config')]),

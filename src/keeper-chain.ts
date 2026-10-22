@@ -52,14 +52,23 @@ export const BTC_RELAY_PROGRAM = new PublicKey(
 export const DEVNET_LOOKUP_TABLE = new PublicKey(
   '9drGTuME311J1BoYDVeNc5QSK4RpuH4kp8T8Uv1tHNgV',
 );
-/** btc-relay `submit_headers` (Anchor discriminator). */
+/** btc-relay `submit_headers` / `submit_headers_from` (Anchor discriminators). */
 const SUBMIT_HEADERS = [151, 116, 247, 16, 199, 207, 48, 40];
+const SUBMIT_HEADERS_FROM = [139, 58, 65, 119, 133, 101, 34, 99];
+/** btc-relay `Relay` layout: the ring of 2,048 entries of 96 bytes at 264 (after the discriminator). */
+const RELAY_RING = 264;
+const RELAY_ENTRY = 96;
+const RELAY_RING_LEN = 2048;
 const WD_IN_BATCH = 1;
 const WD_DELIVERED = 2;
 const COIN_DEPOSIT = 1;
 type Raw = Record<string, unknown>;
 
-/** Where a named Rune's proof buffer key is kept while it is written (resume after a restart). */
+/**
+ * Where a proof buffer's key is kept while it is written and used (resume
+ * after a restart). Keys: a pool (named Rune proofs) or
+ * `tx-<pool>-<txid>` (a big transaction's proof).
+ */
 export interface ProofBufferStore {
   load(pool: string): Promise<Keypair | null>;
   save(pool: string, key: Keypair): Promise<void>;
@@ -107,26 +116,55 @@ export function solanaKeeperChain(o: {
   const account = (k: PublicKey) =>
     rpc(() => conn.getAccountInfo(k, 'confirmed'));
   let alt: AddressLookupTableAccount | null | undefined;
+  async function lookup(): Promise<AddressLookupTableAccount[]> {
+    if (alt === undefined)
+      alt = o.lookupTable
+        ? (await rpc(() => conn.getAddressLookupTable(o.lookupTable!))).value
+        : null;
+    return alt ? [alt] : [];
+  }
+  const message = (
+    ixs: TransactionInstruction[],
+    units: number,
+    blockhash: string,
+    tables: AddressLookupTableAccount[],
+  ) =>
+    new TransactionMessage({
+      payerKey: me,
+      recentBlockhash: blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units }),
+        ...ixs,
+      ],
+    }).compileToV0Message(tables);
+  /** These instructions fit one transaction (1,232 bytes, signatures included). */
+  async function fits(ixs: TransactionInstruction[], units: number) {
+    try {
+      const m = message(
+        ixs,
+        units,
+        PublicKey.default.toBase58(),
+        await lookup(),
+      );
+      return (
+        1 + 64 * m.header.numRequiredSignatures + m.serialize().length <= 1232
+      );
+    } catch {
+      return false; // more than a message holds
+    }
+  }
   async function send(
     ixs: TransactionInstruction[],
     label: string,
     extra: Keypair[] = [],
     units = 400_000,
   ): Promise<string> {
-    if (alt === undefined && o.lookupTable)
-      alt = (await rpc(() => conn.getAddressLookupTable(o.lookupTable!))).value;
+    const tables = await lookup();
     for (let attempt = 0; attempt < 3; attempt++) {
       const { blockhash, lastValidBlockHeight } = await rpc(() =>
         conn.getLatestBlockhash('confirmed'),
       );
-      const msg = new TransactionMessage({
-        payerKey: me,
-        recentBlockhash: blockhash,
-        instructions: [
-          ComputeBudgetProgram.setComputeUnitLimit({ units }),
-          ...ixs,
-        ],
-      }).compileToV0Message(alt ? [alt] : []);
+      const msg = message(ixs, units, blockhash, tables);
       const tx = new VersionedTransaction(msg);
       tx.sign([o.payer, ...extra]);
       let sig: string;
@@ -205,11 +243,167 @@ export function solanaKeeperChain(o: {
       displayHex.match(/../g)!.map((h) => parseInt(h, 16)),
     ).reverse();
 
+  /**
+   * Writes `payload` into a proof buffer (kept under `key` in the store, so
+   * a restart resumes it), runs `use` with it, then closes it (rent back),
+   * also when `use` fails (the next try writes it again).
+   */
+  async function inBuffer(
+    key: string,
+    payload: Uint8Array,
+    use: (buffer: PublicKey) => Promise<string>,
+  ): Promise<string> {
+    const space = 44 + payload.length;
+    const close = (k: Keypair) =>
+      send(
+        [
+          instruction(
+            'buffer_close',
+            {},
+            { authority: me, buffer: k.publicKey },
+          ),
+        ],
+        'buffer_close',
+      );
+    let buffer = await buffers.load(key);
+    let a = buffer ? await account(buffer.publicKey) : null;
+    if (
+      buffer &&
+      a &&
+      (a.data.length !== space ||
+        new DataView(a.data.buffer, a.data.byteOffset).getUint32(40, true) !==
+          payload.length)
+    ) {
+      await close(buffer); // an older proof (another size): rent back, start again
+      a = null;
+      buffer = null;
+    }
+    if (!buffer || !a) {
+      buffer ??= Keypair.generate();
+      await buffers.save(key, buffer);
+      const rent = await rpc(() =>
+        conn.getMinimumBalanceForRentExemption(space),
+      );
+      const have = await rpc(() => conn.getBalance(me));
+      if (have < rent + 20_000_000)
+        throw new Error(
+          `the proof buffer needs ${rent / 1e9} SOL of rent (back when it closes); the keeper has ${have / 1e9}`,
+        );
+      await send(
+        [
+          SystemProgram.createAccount({
+            fromPubkey: me,
+            newAccountPubkey: buffer.publicKey,
+            lamports: rent,
+            space,
+            programId: PROGRAM_ID,
+          }),
+          instruction(
+            'buffer_init',
+            { len: payload.length },
+            { authority: me, buffer: buffer.publicKey },
+          ),
+        ],
+        'buffer_init',
+        [buffer],
+      );
+    }
+    const CHUNK = 900;
+    const have = (await account(buffer.publicKey))!.data;
+    let writes = 0;
+    for (let off = 0; off < payload.length; off += CHUNK) {
+      const part = payload.subarray(off, off + CHUNK);
+      const now = have.subarray(44 + off, 44 + off + part.length);
+      if (now.length === part.length && now.every((x, i) => x === part[i]))
+        continue;
+      await send(
+        [
+          instruction(
+            'buffer_write',
+            { offset: off, data: part },
+            { authority: me, buffer: buffer.publicKey },
+          ),
+        ],
+        'buffer_write',
+      );
+      writes++;
+    }
+    log(
+      `${key.slice(0, 12)}..: proof buffer ${buffer.publicKey.toBase58()} written (${payload.length} bytes, ${writes} writes)`,
+    );
+    try {
+      return await use(buffer.publicKey);
+    } finally {
+      try {
+        await close(buffer);
+        await buffers.clear(key);
+      } catch (e) {
+        log(
+          `${key.slice(0, 12)}..: buffer close failed (retried next time): ${String((e as Error).message ?? e).slice(0, 120)}`,
+        );
+      }
+    }
+  }
+  /** named.rs `TxPayload`: the transaction, its branch, the block's coinbase if needed. */
+  const txPayload = (p: RelayerProof) => {
+    const bytes = (b: Uint8Array) =>
+      concat(le(b.length, 4), Uint8Array.from(b));
+    const br = (bs: Uint8Array[]) =>
+      concat(
+        Uint8Array.from([bs.length]),
+        ...bs.map((x) => Uint8Array.from(x)),
+      );
+    return p.coinbase
+      ? concat(
+          bytes(p.rawTx),
+          br(p.branch),
+          bytes(p.coinbase.rawTx),
+          br(p.coinbase.branch),
+        )
+      : concat(bytes(p.rawTx), br(p.branch));
+  };
+  /**
+   * A proof inline when it fits one transaction (and needs no block depth),
+   * else from a buffer: `inline` / `buffered` build the instruction.
+   */
+  async function proveWith(
+    label: string,
+    key: string,
+    p: RelayerProof,
+    inline: () => Promise<TransactionInstruction>,
+    buffered: (buffer: PublicKey) => Promise<TransactionInstruction>,
+    units: number,
+  ): Promise<string> {
+    const ix = await inline();
+    if (!p.coinbase && (await fits([ix], units)))
+      return send([ix], label, [], units);
+    return inBuffer(key, txPayload(p), async (buffer) =>
+      send([await buffered(buffer)], `${label}_buffered`, [], units),
+    );
+  }
+
   return {
     async relayTip() {
       const a = await account((await bitcoinConfig()).relay);
       if (!a) throw new Error('no relay account');
       return new DataView(a.data.buffer, a.data.byteOffset).getUint32(52, true);
+    },
+    async relayHash(height: number) {
+      const relay = (await bitcoinConfig()).relay;
+      const a = await rpc(() =>
+        conn.getAccountInfo(relay, {
+          commitment: 'confirmed',
+          dataSlice: {
+            offset: RELAY_RING + (height % RELAY_RING_LEN) * RELAY_ENTRY,
+            length: RELAY_ENTRY,
+          },
+        }),
+      );
+      if (!a || a.data.length < RELAY_ENTRY) return null;
+      const e = Uint8Array.from(a.data);
+      // An old slot holds another height (the ring wraps).
+      if (new DataView(e.buffer).getUint32(80, true) !== height) return null;
+      return display(e.subarray(0, 32));
     },
     async submitHeaders(headers: Uint8Array[]) {
       const relay = (await bitcoinConfig()).relay;
@@ -230,6 +424,38 @@ export function solanaKeeperChain(o: {
           }),
         ],
         'submit_headers',
+      );
+    },
+    async submitHeadersFrom(headers: Uint8Array[]) {
+      const relay = (await bitcoinConfig()).relay;
+      const payload = concat(...headers.map((h) => Uint8Array.from(h)));
+      return inBuffer(
+        `headers-${display(headers[0].subarray(4, 36))}`,
+        payload,
+        (buffer) =>
+          send(
+            [
+              new TransactionInstruction({
+                programId: BTC_RELAY_PROGRAM,
+                keys: [
+                  { pubkey: me, isSigner: true, isWritable: false },
+                  { pubkey: relay, isSigner: false, isWritable: true },
+                  { pubkey: buffer, isSigner: false, isWritable: false },
+                ],
+                // The payload starts after the buffer's 44-byte header.
+                data: Buffer.from(
+                  concat(
+                    Uint8Array.from(SUBMIT_HEADERS_FROM),
+                    le(44, 4),
+                    le(headers.length, 2),
+                  ),
+                ),
+              }),
+            ],
+            'submit_headers_from',
+            [],
+            1_400_000,
+          ),
       );
     },
     minConfirmations: async () => (await bitcoinConfig()).minConf,
@@ -319,125 +545,62 @@ export function solanaKeeperChain(o: {
     },
     async activate(pool: string, p: RelayerProof) {
       const pk = new PublicKey(pool);
-      return send(
-        [
+      const accounts = await proofAccounts(pk);
+      return proveWith(
+        'activate_by_proof',
+        `tx-${pool}-${display(p.txid)}`,
+        p,
+        async () =>
           instruction(
             'activate_by_proof',
             { height: p.height, raw_tx: p.rawTx, branch: branch(p.branch) },
-            await proofAccounts(pk),
+            accounts,
           ),
-        ],
-        'activate_by_proof',
-        [],
+        async (buffer) =>
+          instruction(
+            'activate_by_proof_buffered',
+            { height: p.height },
+            { ...accounts, buffer },
+          ),
         600_000,
       );
     },
     async activateNamed(pool: string, np: RelayerNamedProof) {
       const pk = new PublicKey(pool);
-      const payload = Uint8Array.from(np.payload);
-      const space = 44 + payload.length;
-      const close = (k: Keypair) =>
+      const accounts = await proofAccounts(pk);
+      return inBuffer(pool, Uint8Array.from(np.payload), async (buffer) =>
         send(
           [
             instruction(
-              'buffer_close',
-              {},
-              { authority: me, buffer: k.publicKey },
+              'activate_named',
+              { commit_height: np.commitHeight, commit_index: np.commitIndex },
+              { ...accounts, buffer },
             ),
           ],
-          'buffer_close',
-        );
-      let buffer = await buffers.load(pool);
-      let a = buffer ? await account(buffer.publicKey) : null;
-      if (
-        buffer &&
-        a &&
-        (a.data.length !== space ||
-          new DataView(a.data.buffer, a.data.byteOffset).getUint32(40, true) !==
-            payload.length)
-      ) {
-        await close(buffer); // an older proof (another size): rent back, start again
-        a = null;
-        buffer = null;
-      }
-      if (!buffer || !a) {
-        buffer ??= Keypair.generate();
-        await buffers.save(pool, buffer);
-        const rent = await rpc(() =>
-          conn.getMinimumBalanceForRentExemption(space),
-        );
-        const have = await rpc(() => conn.getBalance(me));
-        if (have < rent + 20_000_000)
-          throw new Error(
-            `the proof buffer needs ${rent / 1e9} SOL of rent (back when it closes); the keeper has ${have / 1e9}`,
-          );
-        await send(
-          [
-            SystemProgram.createAccount({
-              fromPubkey: me,
-              newAccountPubkey: buffer.publicKey,
-              lamports: rent,
-              space,
-              programId: PROGRAM_ID,
-            }),
-            instruction(
-              'buffer_init',
-              { len: payload.length },
-              { authority: me, buffer: buffer.publicKey },
-            ),
-          ],
-          'buffer_init',
-          [buffer],
-        );
-      }
-      const CHUNK = 900;
-      const have = (await account(buffer.publicKey))!.data;
-      let writes = 0;
-      for (let off = 0; off < payload.length; off += CHUNK) {
-        const part = payload.subarray(off, off + CHUNK);
-        const now = have.subarray(44 + off, 44 + off + part.length);
-        if (now.length === part.length && now.every((x, i) => x === part[i]))
-          continue;
-        await send(
-          [
-            instruction(
-              'buffer_write',
-              { offset: off, data: part },
-              { authority: me, buffer: buffer.publicKey },
-            ),
-          ],
-          'buffer_write',
-        );
-        writes++;
-      }
-      log(
-        `${pool.slice(0, 6)}..: proof buffer ${buffer.publicKey.toBase58()} written (${payload.length} bytes, ${writes} writes)`,
+          'activate_named',
+          [],
+          600_000,
+        ),
       );
-      const sig = await send(
-        [
-          instruction(
-            'activate_named',
-            { commit_height: np.commitHeight, commit_index: np.commitIndex },
-            { ...(await proofAccounts(pk)), buffer: buffer.publicKey },
-          ),
-        ],
-        'activate_named',
-        [],
-        600_000,
-      );
-      await close(buffer);
-      await buffers.clear(pool);
-      return sig;
     },
     async proveVaultSpend(
       pool: string,
       p: RelayerProof,
       ids: bigint[],
-      sweeps: string[],
+      inputs: { txid: string; vout: number }[],
     ) {
       const pk = new PublicKey(pool);
-      return send(
-        [
+      const accounts = await proofAccounts(pk);
+      const rest = [
+        ...ids.map((id) => writable(pda.withdrawal(pk, id))),
+        // Every input but the vault coin: its coin record address.
+        ...inputs.map((i) => writable(coinOf(pk, internal(i.txid), i.vout))),
+      ];
+      return proveWith(
+        'prove_vault_spend',
+        `tx-${pool}-${display(p.txid)}`,
+        p,
+        async () =>
           instruction(
             'prove_vault_spend',
             {
@@ -446,15 +609,16 @@ export function solanaKeeperChain(o: {
               index: p.index,
               branch: branch(p.branch),
             },
-            await proofAccounts(pk),
-            [
-              ...ids.map((id) => writable(pda.withdrawal(pk, id))),
-              ...sweeps.map((s) => writable(new PublicKey(s))),
-            ],
+            accounts,
+            rest,
           ),
-        ],
-        'prove_vault_spend',
-        [],
+        async (buffer) =>
+          instruction(
+            'prove_vault_spend_buffered',
+            { height: p.height, index: p.index },
+            { ...accounts, buffer },
+            rest,
+          ),
         1_000_000,
       );
     },
@@ -540,13 +704,26 @@ export function solanaKeeperChain(o: {
     async proveCoinSpend(
       pool: string,
       p: RelayerProof,
-      inputs: string[],
+      inputs: { txid: string; vout: number }[],
       outputs: number[],
     ) {
       const pk = new PublicKey(pool);
       const txid = Uint8Array.from(p.txid);
-      return send(
-        [
+      const accounts = {
+        ...(await proofAccounts(pk)),
+        proven: provenOf(pk, txid),
+      };
+      const rest = [
+        // EVERY input, in order: its coin record address (a known coin is
+        // counted, no record counts zero).
+        ...inputs.map((i) => writable(coinOf(pk, internal(i.txid), i.vout))),
+        ...outputs.map((v) => writable(coinOf(pk, txid, v))),
+      ];
+      return proveWith(
+        'prove_coin_spend',
+        `tx-${pool}-${display(txid)}`,
+        p,
+        async () =>
           instruction(
             'prove_coin_spend',
             {
@@ -558,15 +735,22 @@ export function solanaKeeperChain(o: {
               inputs: inputs.length,
               outputs,
             },
-            { ...(await proofAccounts(pk)), proven: provenOf(pk, txid) },
-            [
-              ...inputs.map((s) => writable(new PublicKey(s))),
-              ...outputs.map((v) => writable(coinOf(pk, txid, v))),
-            ],
+            accounts,
+            rest,
           ),
-        ],
-        'prove_coin_spend',
-        [],
+        async (buffer) =>
+          instruction(
+            'prove_coin_spend_buffered',
+            {
+              txid,
+              height: p.height,
+              index: p.index,
+              inputs: inputs.length,
+              outputs,
+            },
+            { ...accounts, buffer },
+            rest,
+          ),
         1_000_000,
       );
     },
