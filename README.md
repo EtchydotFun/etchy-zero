@@ -16,10 +16,10 @@ This package gives you the same access etchy.fun has: market data, exact quotes,
 Solana and Bitcoin wallets, moving Runes and BTC between the two chains, and the keeper that keeps
 pools in step with Bitcoin.
 
-> **Status:** live on Solana mainnet. New launches are open to a short list of wallets while the
-> first ones are tested. Devnet stays up for testing: trades there use test SOL and test WBTC,
-> while its Bitcoin transactions (launches, deposits, payouts) are real. Addresses for both are
-> under [Networks](#networks).
+> **Status:** live on Solana mainnet and open to everyone: launch a Rune at
+> [etchy.fun/create/zero](https://etchy.fun/create/zero). Devnet stays up for testing: trades
+> there use test SOL and test WBTC, while its Bitcoin transactions (launches, deposits, payouts)
+> are real. Addresses for both are under [Networks](#networks).
 
 ## How it works
 
