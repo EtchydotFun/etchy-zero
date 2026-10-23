@@ -1,5 +1,10 @@
-import { PublicKey, TransactionInstruction } from '@solana/web3.js';
+import {
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+} from '@solana/web3.js';
 import { Buffer } from 'buffer';
+import { ATA_PROGRAM, TOKEN_PROGRAM } from './client.ts';
 
 /**
  * Add BTC through NEAR Intents, swapped to WBTC (the program's `sol_swap`):
@@ -411,6 +416,62 @@ export async function nearStatus(
 // ---------------------------------------------------------------- Jupiter route (mainnet)
 export const JUPITER_URL = 'https://lite-api.jup.ag/swap/v1';
 const WSOL = 'So11111111111111111111111111111111111111112';
+/** Jupiter's aggregator (v6): the program of a route's swap (read from its API, 2026-10-22). */
+export const JUPITER_PROGRAM = new PublicKey(
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+);
+/** Accounts a route may name (with lookup tables it fits next to a pool instruction). */
+export const JUPITER_MAX_ACCOUNTS = 40;
+/**
+ * A route's instructions only call Jupiter, the token program, the
+ * associated token program and the system program (SOL wrapping): anything
+ * else and the route is refused.
+ */
+export function routeProgramsOk(ixs: TransactionInstruction[]): boolean {
+  const ok = new Set(
+    [JUPITER_PROGRAM, TOKEN_PROGRAM, ATA_PROGRAM, SystemProgram.programId].map(
+      (k) => k.toBase58(),
+    ),
+  );
+  return ixs.every((ix) => ok.has(ix.programId.toBase58()));
+}
+
+/** A Jupiter price only (no instructions): SOL -> WBTC (`buy`) or WBTC -> SOL. */
+export async function jupiterQuote(
+  p: {
+    buy: boolean;
+    amount: bigint;
+    wbtcMint: PublicKey;
+    slippageBps?: number;
+    maxAccounts?: number;
+    baseUrl?: string;
+    apiKey?: string;
+  },
+  f: typeof fetch = fetch,
+): Promise<{ expectedOut: bigint; worstOut: bigint; impactPct: number }> {
+  const [a, b] = p.buy
+    ? [WSOL, p.wbtcMint.toBase58()]
+    : [p.wbtcMint.toBase58(), WSOL];
+  const r = await f(
+    `${p.baseUrl ?? JUPITER_URL}/quote?inputMint=${a}&outputMint=${b}&amount=${p.amount}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    { headers: jupHeaders(p.apiKey) },
+  );
+  if (!r.ok) throw new Error(`Jupiter quote: ${r.status}`);
+  const q = (await r.json()) as {
+    outAmount: string;
+    otherAmountThreshold: string;
+    priceImpactPct?: string;
+  };
+  return {
+    expectedOut: BigInt(q.outAmount),
+    worstOut: BigInt(q.otherAmountThreshold),
+    impactPct: Number(q.priceImpactPct ?? 0),
+  };
+}
+
+/** Jupiter's paid API (api.jup.ag) takes its key in `x-api-key`. */
+const jupHeaders = (apiKey?: string): Record<string, string> =>
+  apiKey ? { 'x-api-key': apiKey } : {};
 
 /** One Jupiter instruction as the swap-instructions API returns it. */
 interface JupIx {
@@ -440,16 +501,20 @@ export async function jupiterRoute(
     swapper: PublicKey;
     lamports: bigint;
     wbtcMint: PublicKey;
+    /** The WBTC account paid: a wallet's swap inbox, or a buyer's own WBTC account. */
     inbox: PublicKey;
     minOut: bigint;
     slippageBps?: number;
+    maxAccounts?: number;
     baseUrl?: string;
+    apiKey?: string;
   },
   f: typeof fetch = fetch,
 ) {
   const base = p.baseUrl ?? JUPITER_URL;
   const qr = await f(
-    `${base}/quote?inputMint=${WSOL}&outputMint=${p.wbtcMint.toBase58()}&amount=${p.lamports}&slippageBps=${p.slippageBps ?? 50}`,
+    `${base}/quote?inputMint=${WSOL}&outputMint=${p.wbtcMint.toBase58()}&amount=${p.lamports}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    { headers: jupHeaders(p.apiKey) },
   );
   if (!qr.ok) throw new Error(`Jupiter quote: ${qr.status}`);
   const quote = (await qr.json()) as {
@@ -460,7 +525,7 @@ export async function jupiterRoute(
   if (BigInt(quote.otherAmountThreshold) < p.minOut) return null;
   const sr = await f(`${base}/swap-instructions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...jupHeaders(p.apiKey) },
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: p.swapper.toBase58(),
@@ -470,22 +535,41 @@ export async function jupiterRoute(
     }),
   });
   if (!sr.ok) throw new Error(`Jupiter swap-instructions: ${sr.status}`);
-  const s = (await sr.json()) as {
-    setupInstructions?: JupIx[];
-    swapInstruction: JupIx;
-    cleanupInstruction?: JupIx | null;
-    computeBudgetInstructions?: JupIx[];
-    addressLookupTableAddresses?: string[];
-  };
+  return routeOf(quote, await sr.json());
+}
+
+type SwapInstructions = {
+  setupInstructions?: JupIx[];
+  swapInstruction: JupIx;
+  cleanupInstruction?: JupIx | null;
+  computeBudgetInstructions?: JupIx[];
+  addressLookupTableAddresses?: string[];
+  computeUnitLimit?: number;
+};
+/** A route from Jupiter's answer; refused if it calls anything unexpected. */
+function routeOf(
+  quote: { outAmount: string; otherAmountThreshold: string },
+  s: SwapInstructions,
+) {
+  const instructions = [
+    ...(s.setupInstructions ?? []),
+    s.swapInstruction,
+    ...(s.cleanupInstruction ? [s.cleanupInstruction] : []),
+  ].map(toIx);
+  if (s.swapInstruction?.programId !== JUPITER_PROGRAM.toBase58())
+    throw new Error('Jupiter route: the swap is not Jupiter');
+  if (!routeProgramsOk(instructions))
+    throw new Error('Jupiter route: an unexpected program');
   return {
     expectedOut: BigInt(quote.outAmount),
     worstOut: BigInt(quote.otherAmountThreshold),
     computeBudget: (s.computeBudgetInstructions ?? []).map(toIx),
-    instructions: [
-      ...(s.setupInstructions ?? []),
-      s.swapInstruction,
-      ...(s.cleanupInstruction ? [s.cleanupInstruction] : []),
-    ].map(toIx),
+    /** Jupiter's simulated compute units for the swap alone (null: not given). */
+    units:
+      typeof s.computeUnitLimit === 'number' && s.computeUnitLimit > 0
+        ? s.computeUnitLimit
+        : null,
+    instructions,
     lookupTables: (s.addressLookupTableAddresses ?? []).map(
       (a) => new PublicKey(a),
     ),
@@ -505,13 +589,16 @@ export async function jupiterSellRoute(
     wbtcMint: PublicKey;
     minLamports: bigint;
     slippageBps?: number;
+    maxAccounts?: number;
     baseUrl?: string;
+    apiKey?: string;
   },
   f: typeof fetch = fetch,
 ) {
   const base = p.baseUrl ?? JUPITER_URL;
   const qr = await f(
-    `${base}/quote?inputMint=${p.wbtcMint.toBase58()}&outputMint=${WSOL}&amount=${p.sats}&slippageBps=${p.slippageBps ?? 50}`,
+    `${base}/quote?inputMint=${p.wbtcMint.toBase58()}&outputMint=${WSOL}&amount=${p.sats}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    { headers: jupHeaders(p.apiKey) },
   );
   if (!qr.ok) throw new Error(`Jupiter quote: ${qr.status}`);
   const quote = (await qr.json()) as {
@@ -521,7 +608,7 @@ export async function jupiterSellRoute(
   if (BigInt(quote.otherAmountThreshold) < p.minLamports) return null;
   const sr = await f(`${base}/swap-instructions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...jupHeaders(p.apiKey) },
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: p.sender.toBase58(),
@@ -530,24 +617,6 @@ export async function jupiterSellRoute(
     }),
   });
   if (!sr.ok) throw new Error(`Jupiter swap-instructions: ${sr.status}`);
-  const s = (await sr.json()) as {
-    setupInstructions?: JupIx[];
-    swapInstruction: JupIx;
-    cleanupInstruction?: JupIx | null;
-    computeBudgetInstructions?: JupIx[];
-    addressLookupTableAddresses?: string[];
-  };
-  return {
-    expectedOut: BigInt(quote.outAmount),
-    worstOut: BigInt(quote.otherAmountThreshold),
-    computeBudget: (s.computeBudgetInstructions ?? []).map(toIx),
-    instructions: [
-      ...(s.setupInstructions ?? []),
-      s.swapInstruction,
-      ...(s.cleanupInstruction ? [s.cleanupInstruction] : []),
-    ].map(toIx),
-    lookupTables: (s.addressLookupTableAddresses ?? []).map(
-      (a) => new PublicKey(a),
-    ),
-  };
+  return routeOf(quote, await sr.json());
 }
+export type JupiterRoute = ReturnType<typeof routeOf>;

@@ -36,9 +36,9 @@ export interface RuneLaunchInfo {
   image: string | null;
   /** The same Rune's Solana mint, when given. */
   solanaMint: string | null;
-  /** Who gets the creator part of the fees: HOLDERS (on Bitcoin) or ROUTED. */
-  fees: 'HOLDERS' | 'ROUTED' | null;
-  /** ROUTED: the Bitcoin addresses and their shares (basis points of it). */
+  /** Who gets the creator part of the fees: HOLDERS, ROUTED or CREATOR. */
+  fees: 'HOLDERS' | 'ROUTED' | 'CREATOR' | null;
+  /** ROUTED / CREATOR: the wallets and their shares (basis points of it), at launch. */
   feeRoute: { address: string; bps: number }[] | null;
   /** The wallet that launched it, and what it paid with. */
   deployer: string | null;
@@ -321,7 +321,9 @@ export function launchInfoOf(metadata: unknown): RuneLaunchInfo {
         ? 'HOLDERS'
         : str('fees') === 'ROUTED'
           ? 'ROUTED'
-          : null,
+          : str('fees') === 'CREATOR'
+            ? 'CREATOR'
+            : null,
     feeRoute: parseFeeRoute(str('feeRoute')),
     deployer: str('deployer', 90),
     paidWith:

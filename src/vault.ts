@@ -14,8 +14,8 @@ import type { PoolRelayerVault } from './keeper.ts';
  * Schnorr; no person or machine has it, Etchy included). It signs only what
  * the rune-pool program's finalized state asks for.
  *
- * ANYONE may call `runOpenVault`, `runStartBatch` and `runPayBatch` (an
- * anonymous identity is fine): the canister then picks the recent
+ * ANYONE may call `runOpenVault`, `runStartBatch`, `runPayBatch` and
+ * `runWithdrawalFee` (an anonymous identity is fine): the canister then picks the recent
  * blockhash and the Bitcoin fee rate itself and sends what it signs, so no
  * caller can withhold or bend anything. Anyone's calls are limited per pool
  * per hour (they cost the canister cycles; anyone may top them up).
@@ -24,6 +24,8 @@ import type { PoolRelayerVault } from './keeper.ts';
  * (import `@etchydotfun/rune-pool/vault`).
  */
 export const ICP_HOST = 'https://icp-api.io';
+/** The mainnet canister (ICP production key `key_1`, Solana and Bitcoin mainnet). */
+export const MAINNET_VAULT_CANISTER = 'j22zd-eyaaa-aaaao-qqkza-cai';
 /** The devnet test canister (ICP test key, Solana devnet). */
 export const DEVNET_VAULT_CANISTER = 'rdl3p-uqaaa-aaaaa-qhvpq-cai';
 
@@ -88,6 +90,7 @@ const idl: IDL.InterfaceFactory = ({ IDL: I }) => {
     run_open_vault: I.Func([I.Text], [R(SolanaSent)], []),
     run_start_batch: I.Func([I.Text], [R(SolanaSent)], []),
     run_pay_batch: I.Func([I.Text], [R(BitcoinTx)], []),
+    run_withdrawal_fee: I.Func([], [R(SolanaSent)], []),
     status: I.Func([], [Status], ['query']),
   });
 };
@@ -168,6 +171,13 @@ export async function createVaultCanister(
       ok<VaultSent>(await actor.run_start_batch(pool)),
     runPayBatch: async (pool: string) =>
       ok<VaultPayment>(await actor.run_pay_batch(pool)),
+    /**
+     * The program's withdrawal fee set to what a withdrawal costs at the
+     * Bitcoin fee rate now (up once 10% short, down once 25% high, at most
+     * every 30 minutes); `FEE_UNCHANGED` / `FEE_SET_RECENTLY` otherwise.
+     */
+    runWithdrawalFee: async () =>
+      ok<VaultSent>(await actor.run_withdrawal_fee()),
     status: async () => (await actor.status()) as VaultStatus,
   };
 }
@@ -183,5 +193,6 @@ export function keeperVault(v: VaultCanister): PoolRelayerVault {
       const b = await v.runPayBatch(pool);
       return { txid: b.txid, feeRate: Number(b.fee_rate), version: b.version };
     },
+    withdrawalFee: async () => (await v.runWithdrawalFee()).signature,
   };
 }

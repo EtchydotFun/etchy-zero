@@ -1,6 +1,6 @@
 {
   "name": "@etchydotfun/rune-pool",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for Etchy Zero, the AMM for real Bitcoin Runes on Solana: market data, quotes, trades from Solana and Bitcoin wallets, deposits, withdrawals and the keeper.",
   "type": "module",
   "sideEffects": false,

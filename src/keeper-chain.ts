@@ -27,6 +27,7 @@ import {
 } from './keeper.ts';
 import {
   accountDiscriminator,
+  creditedRunes,
   decodeAccount,
   instruction,
   pda,
@@ -52,6 +53,10 @@ export const BTC_RELAY_PROGRAM = new PublicKey(
 export const DEVNET_LOOKUP_TABLE = new PublicKey(
   '9drGTuME311J1BoYDVeNc5QSK4RpuH4kp8T8Uv1tHNgV',
 );
+/** The mainnet lookup table (the same accounts, plus the Etchy API's). */
+export const MAINNET_LOOKUP_TABLE = new PublicKey(
+  'C6DTPV3SKeunnPvtbbzZbjLNFG2u5nhFN2ognYiyUN4g',
+);
 /** btc-relay `submit_headers` / `submit_headers_from` (Anchor discriminators). */
 const SUBMIT_HEADERS = [151, 116, 247, 16, 199, 207, 48, 40];
 const SUBMIT_HEADERS_FROM = [139, 58, 65, 119, 133, 101, 34, 99];
@@ -62,6 +67,8 @@ const RELAY_RING_LEN = 2048;
 const WD_IN_BATCH = 1;
 const WD_DELIVERED = 2;
 const COIN_DEPOSIT = 1;
+/** `ProvenTx` with `units` (re-proofs); older markers are 76 bytes. */
+const PROVEN_SPACE = 8 + 32 + 32 + 4 + 16;
 type Raw = Record<string, unknown>;
 
 /**
@@ -238,6 +245,40 @@ export function solanaKeeperChain(o: {
     Array.from(Uint8Array.from(internal).reverse(), (x) =>
       x.toString(16).padStart(2, '0'),
     ).join('');
+  /** The relay's block hash at `height` (display order); null: not kept. */
+  async function relayHashOf(height: number) {
+    const relay = (await bitcoinConfig()).relay;
+    const a = await rpc(() =>
+      conn.getAccountInfo(relay, {
+        commitment: 'confirmed',
+        dataSlice: {
+          offset: RELAY_RING + (height % RELAY_RING_LEN) * RELAY_ENTRY,
+          length: RELAY_ENTRY,
+        },
+      }),
+    );
+    if (!a || a.data.length < RELAY_ENTRY) return null;
+    const e = Uint8Array.from(a.data);
+    // An old slot holds another height (the ring wraps).
+    if (new DataView(e.buffer).getUint32(80, true) !== height) return null;
+    return display(e.subarray(0, 32));
+  }
+  /**
+   * The remembered blocks a proof needs: those of `heights` the relay no
+   * longer keeps (the keeper remembers them first), as last accounts.
+   */
+  async function knownBlocks(heights: number[]): Promise<AccountMeta[]> {
+    const relay = (await bitcoinConfig()).relay;
+    const out: AccountMeta[] = [];
+    for (const h of [...new Set(heights)])
+      if ((await relayHashOf(h)) === null)
+        out.push({
+          pubkey: pda.knownBlock(relay, h),
+          isSigner: false,
+          isWritable: false,
+        });
+    return out;
+  }
   const internal = (displayHex: string) =>
     Uint8Array.from(
       displayHex.match(/../g)!.map((h) => parseInt(h, 16)),
@@ -363,6 +404,52 @@ export function solanaKeeperChain(o: {
       : concat(bytes(p.rawTx), br(p.branch));
   };
   /**
+   * `prove_coin_spend` (first proof) or `reprove_coin_spend` (inputs known
+   * since): EVERY input's coin record address, in order (a known coin is
+   * counted, no record counts zero), then the outputs that get Runes.
+   */
+  async function coinSpend(
+    name: 'prove_coin_spend' | 'reprove_coin_spend',
+    pool: string,
+    p: RelayerProof,
+    inputs: { txid: string; vout: number }[],
+    outputs: number[],
+  ) {
+    const pk = new PublicKey(pool);
+    const txid = Uint8Array.from(p.txid);
+    const accounts = {
+      ...(await proofAccounts(pk)),
+      proven: provenOf(pk, txid),
+    };
+    const rest = [
+      ...inputs.map((i) => writable(coinOf(pk, internal(i.txid), i.vout))),
+      ...outputs.map((v) => writable(coinOf(pk, txid, v))),
+      ...(await knownBlocks([p.height])),
+    ];
+    const args = {
+      txid,
+      height: p.height,
+      index: p.index,
+      inputs: inputs.length,
+      outputs,
+    };
+    return proveWith(
+      name,
+      `tx-${pool}-${display(txid)}`,
+      p,
+      async () =>
+        instruction(
+          name,
+          { ...args, raw_tx: p.rawTx, branch: branch(p.branch) },
+          accounts,
+          rest,
+        ),
+      async (buffer) =>
+        instruction(`${name}_buffered`, args, { ...accounts, buffer }, rest),
+      1_000_000,
+    );
+  }
+  /**
    * A proof inline when it fits one transaction (and needs no block depth),
    * else from a buffer: `inline` / `buffered` build the instruction.
    */
@@ -388,23 +475,7 @@ export function solanaKeeperChain(o: {
       if (!a) throw new Error('no relay account');
       return new DataView(a.data.buffer, a.data.byteOffset).getUint32(52, true);
     },
-    async relayHash(height: number) {
-      const relay = (await bitcoinConfig()).relay;
-      const a = await rpc(() =>
-        conn.getAccountInfo(relay, {
-          commitment: 'confirmed',
-          dataSlice: {
-            offset: RELAY_RING + (height % RELAY_RING_LEN) * RELAY_ENTRY,
-            length: RELAY_ENTRY,
-          },
-        }),
-      );
-      if (!a || a.data.length < RELAY_ENTRY) return null;
-      const e = Uint8Array.from(a.data);
-      // An old slot holds another height (the ring wraps).
-      if (new DataView(e.buffer).getUint32(80, true) !== height) return null;
-      return display(e.subarray(0, 32));
-    },
+    relayHash: relayHashOf,
     async submitHeaders(headers: Uint8Array[]) {
       const relay = (await bitcoinConfig()).relay;
       const data = concat(
@@ -546,6 +617,7 @@ export function solanaKeeperChain(o: {
     async activate(pool: string, p: RelayerProof) {
       const pk = new PublicKey(pool);
       const accounts = await proofAccounts(pk);
+      const rest = await knownBlocks([p.height]);
       return proveWith(
         'activate_by_proof',
         `tx-${pool}-${display(p.txid)}`,
@@ -555,12 +627,14 @@ export function solanaKeeperChain(o: {
             'activate_by_proof',
             { height: p.height, raw_tx: p.rawTx, branch: branch(p.branch) },
             accounts,
+            rest,
           ),
         async (buffer) =>
           instruction(
             'activate_by_proof_buffered',
             { height: p.height },
             { ...accounts, buffer },
+            rest,
           ),
         600_000,
       );
@@ -568,6 +642,10 @@ export function solanaKeeperChain(o: {
     async activateNamed(pool: string, np: RelayerNamedProof) {
       const pk = new PublicKey(pool);
       const accounts = await proofAccounts(pk);
+      const pa = await account(pk);
+      if (!pa) throw new Error('no such pool');
+      const etched = Number(decodeAccount<Raw>('Pool', pa.data).rune_block);
+      const rest = await knownBlocks([etched, np.commitHeight]);
       return inBuffer(pool, Uint8Array.from(np.payload), async (buffer) =>
         send(
           [
@@ -575,6 +653,7 @@ export function solanaKeeperChain(o: {
               'activate_named',
               { commit_height: np.commitHeight, commit_index: np.commitIndex },
               { ...accounts, buffer },
+              rest,
             ),
           ],
           'activate_named',
@@ -590,20 +669,28 @@ export function solanaKeeperChain(o: {
       inputs: { txid: string; vout: number }[],
     ) {
       const pk = new PublicKey(pool);
-      const accounts = await proofAccounts(pk);
+      const txid = Uint8Array.from(p.txid);
+      // The vault transaction is marked proven, so it can never be proven
+      // again as a coin spend.
+      const accounts = {
+        ...(await proofAccounts(pk)),
+        proven: provenOf(pk, txid),
+      };
       const rest = [
         ...ids.map((id) => writable(pda.withdrawal(pk, id))),
         // Every input but the vault coin: its coin record address.
         ...inputs.map((i) => writable(coinOf(pk, internal(i.txid), i.vout))),
+        ...(await knownBlocks([p.height])),
       ];
       return proveWith(
         'prove_vault_spend',
-        `tx-${pool}-${display(p.txid)}`,
+        `tx-${pool}-${display(txid)}`,
         p,
         async () =>
           instruction(
             'prove_vault_spend',
             {
+              txid,
               height: p.height,
               raw_tx: p.rawTx,
               index: p.index,
@@ -615,7 +702,7 @@ export function solanaKeeperChain(o: {
         async (buffer) =>
           instruction(
             'prove_vault_spend_buffered',
-            { height: p.height, index: p.index },
+            { txid, height: p.height, index: p.index },
             { ...accounts, buffer },
             rest,
           ),
@@ -695,63 +782,51 @@ export function solanaKeeperChain(o: {
           runes: c.runes as bigint,
           deposit: c.kind === COIN_DEPOSIT,
           owner: owner.equals(PublicKey.default) ? null : owner.toBase58(),
-          credited: c.credited as boolean,
+          // All of it (a re-proof may add Runes to a credited deposit).
+          credited: creditedRunes(c) >= (c.runes as bigint),
         };
       });
     },
     proven: async (pool: string, txid: string) =>
       !!(await account(provenOf(new PublicKey(pool), internal(txid)))),
-    async proveCoinSpend(
-      pool: string,
-      p: RelayerProof,
-      inputs: { txid: string; vout: number }[],
-      outputs: number[],
+    async provenUnits(pool: string, txid: string) {
+      const a = await account(provenOf(new PublicKey(pool), internal(txid)));
+      if (!a || a.data.length < PROVEN_SPACE) return null;
+      return decodeAccount<Raw>('ProvenTx', a.data).units as bigint;
+    },
+    proveCoinSpend: (pool, p, inputs, outputs) =>
+      coinSpend('prove_coin_spend', pool, p, inputs, outputs),
+    reproveCoinSpend: (pool, p, inputs, outputs) =>
+      coinSpend('reprove_coin_spend', pool, p, inputs, outputs),
+    remembered: async (height: number) =>
+      !!(await account(pda.knownBlock((await bitcoinConfig()).relay, height))),
+    async rememberBlock(
+      height: number,
+      headers: Uint8Array[],
+      anchor: number | null,
     ) {
-      const pk = new PublicKey(pool);
-      const txid = Uint8Array.from(p.txid);
-      const accounts = {
-        ...(await proofAccounts(pk)),
-        proven: provenOf(pk, txid),
-      };
-      const rest = [
-        // EVERY input, in order: its coin record address (a known coin is
-        // counted, no record counts zero).
-        ...inputs.map((i) => writable(coinOf(pk, internal(i.txid), i.vout))),
-        ...outputs.map((v) => writable(coinOf(pk, txid, v))),
-      ];
-      return proveWith(
-        'prove_coin_spend',
-        `tx-${pool}-${display(txid)}`,
-        p,
-        async () =>
-          instruction(
-            'prove_coin_spend',
-            {
-              txid,
-              height: p.height,
-              raw_tx: p.rawTx,
-              index: p.index,
-              branch: branch(p.branch),
-              inputs: inputs.length,
-              outputs,
-            },
-            accounts,
-            rest,
-          ),
-        async (buffer) =>
-          instruction(
-            'prove_coin_spend_buffered',
-            {
-              txid,
-              height: p.height,
-              index: p.index,
-              inputs: inputs.length,
-              outputs,
-            },
-            { ...accounts, buffer },
-            rest,
-          ),
-        1_000_000,
+      const relay = (await bitcoinConfig()).relay;
+      const payload = concat(...headers.map((h) => Uint8Array.from(h)));
+      return inBuffer(`block-${height}`, payload, (buffer) =>
+        send(
+          [
+            instruction(
+              'remember_block',
+              { height },
+              {
+                payer: me,
+                bitcoin: pda.bitcoin(),
+                relay,
+                buffer,
+                block: pda.knownBlock(relay, height),
+                anchor: anchor === null ? null : pda.knownBlock(relay, anchor),
+              },
+            ),
+          ],
+          'remember_block',
+          [],
+          1_400_000,
+        ),
       );
     },
     async creditDeposit(pool: string, c: RelayerCoin) {

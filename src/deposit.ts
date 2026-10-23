@@ -9,7 +9,7 @@ import {
   sha256d,
 } from './bitcoin.ts';
 import { depositMemo, taprootKey } from './messages.ts';
-import { decodeAccount, pda } from './program.ts';
+import { creditedRunes, decodeAccount, pda } from './program.ts';
 
 /**
  * Runes back into a pool, straight from the user's Bitcoin wallet (Xverse,
@@ -417,7 +417,8 @@ export async function depositStatus(o: {
   if (!coin) return { state: 'swept' };
   const c = decodeAccount<Raw>('KnownCoin', coin.data);
   return {
-    state: c.credited ? 'credited' : 'proven',
+    // All of it (a re-proof may add Runes to a deposit credited already).
+    state: creditedRunes(c) >= (c.runes as bigint) ? 'credited' : 'proven',
     runes: c.runes as bigint,
     owner: (c.owner as PublicKey).toBase58(),
   };

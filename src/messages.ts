@@ -1,14 +1,16 @@
 import { PublicKey } from '@solana/web3.js';
 import { concat } from './borsh.ts';
+import { PROGRAM_ID } from './program.ts';
 
 /**
  * Everything a wallet signs or a Bitcoin transaction carries, byte for byte
  * as the program checks it: Rune names, the Bitcoin wallet's signed
  * messages (BIP-322), the Runes deposit memo, and Bitcoin addresses.
  *
- * Every signed message starts with "Etchy Rune Pools (mainnet):" or
- * "(devnet):" (`poolNetwork`), so one signed for devnet never works on
- * mainnet.
+ * Every signed message starts with "Etchy Zero (mainnet):" or "(devnet):"
+ * (`poolNetwork`) and ends with the program's address ("Solana program
+ * <id>."), so one signed for devnet never works on mainnet, nor with
+ * another program.
  */
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const U128_MAX = (1n << 128n) - 1n;
@@ -62,7 +64,9 @@ export const MAINNET_WBTC = new PublicKey(
 /** `Config::network`: "mainnet" with mainnet WBTC as the quote mint, else "devnet". */
 export const poolNetwork = (quoteMint: PublicKey): PoolNetwork =>
   quoteMint.equals(MAINNET_WBTC) ? 'mainnet' : 'devnet';
-const head = (n: PoolNetwork) => `Etchy Rune Pools (${n}):`;
+const head = (n: PoolNetwork) => `Etchy Zero (${n}):`;
+/** The last line of every signed message: the program it is for. */
+const PROGRAM_LINE = `\nSolana program ${PROGRAM_ID.toBase58()}.`;
 
 /**
  * The order a Bitcoin wallet signs for ONE buy (`amount` sats of WBTC from
@@ -83,7 +87,7 @@ export function tradeMessage(
   const what = isBuy
     ? `${h} buy ${label(pool)} with ${formatUnits(amount, 8)} BTC of my Etchy balance, for at least ${formatUnits(minOut, pool.divisibility)} ${name}.`
     : `${h} sell ${formatUnits(amount, pool.divisibility)} ${label(pool)} of my Etchy balance for at least ${formatUnits(minOut, 8)} BTC.`;
-  return `${what}\nOrder ${nonce}, valid until ${expiry} (unix time).`;
+  return `${what}\nOrder ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
 }
 
 /** Lets a Solana key (e.g. a browser session key) send or withdraw up to `amount`; 0 revokes. */
@@ -102,7 +106,7 @@ export function approveMessage(
     amount === 0n
       ? `${h} stop ${delegate} from using my ${name} ${rune}.`
       : `${h} let ${delegate} sell, send or withdraw up to ${formatUnits(amount, pool.divisibility)} ${name} ${rune} of my Etchy balance.`;
-  return `${what}\nApproval ${nonce}, valid until ${expiry} (unix time).`;
+  return `${what}\nApproval ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
 }
 
 /** Moves WBTC out of a Bitcoin wallet's Etchy balance to a Solana wallet. */
@@ -113,7 +117,7 @@ export function sendWbtcMessage(
   nonce: bigint,
   expiry: bigint,
 ): string {
-  return `${head(network)} send ${amount} sats of WBTC from my Etchy balance to the Solana wallet ${toWallet}.\nApproval ${nonce}, valid until ${expiry} (unix time).`;
+  return `${head(network)} send ${amount} sats of WBTC from my Etchy balance to the Solana wallet ${toWallet}.\nApproval ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
 }
 
 /**
@@ -150,7 +154,7 @@ export function nearWithdrawMessage(
   nonce: bigint,
   expiry: bigint,
 ): string {
-  return `${head(network)} withdraw ${formatUnits(amount, 8)} BTC of my Etchy balance to ${btcAddress} through NEAR: sell it for at least ${formatUnits(minLamports, 9)} SOL sent to NEAR's deposit address ${deposit}.\nOrder ${nonce}, valid until ${expiry} (unix time).`;
+  return `${head(network)} withdraw ${formatUnits(amount, 8)} BTC of my Etchy balance to ${btcAddress} through NEAR: sell it for at least ${formatUnits(minLamports, 9)} SOL sent to NEAR's deposit address ${deposit}.\nOrder ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
 }
 
 async function sha256(...parts: Uint8Array[]): Promise<Uint8Array> {

@@ -139,6 +139,22 @@ export function eventsFromLogs(
   return out;
 }
 
+/**
+ * How much of a deposit record (`KnownCoin`, decoded) is credited: version
+ * 2 records keep it in `reserved[1..17]` (a re-proof may add Runes to a
+ * deposit credited already); version 1: `credited` means all of it.
+ */
+export function creditedRunes(c: Record<string, unknown>): bigint {
+  const runes = c.runes as bigint;
+  if ((c.version as number) >= 2) {
+    const b = (c.reserved as Uint8Array).subarray(1, 17);
+    let v = 0n;
+    for (let i = 15; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+    return v;
+  }
+  return c.credited ? runes : 0n;
+}
+
 /** The program's error name for a custom error code (6000 + n). */
 export function errorName(code: number): string | null {
   return IDL.errors?.find((e) => e.code === code)?.name ?? null;
@@ -175,6 +191,8 @@ export const pda = {
   /** A Bitcoin wallet's owner address (its Taproot output key). */
   btcOwner: (taprootKey: Uint8Array) => find([enc('btc_owner'), taprootKey]),
   launch: (launchKey: Uint8Array) => find([enc('launch'), launchKey]),
+  /** Where a pool's creator fees go (owners and shares); anyone pays them out. */
+  feeRoute: (pool: PublicKey) => find([enc('fee_route'), pool.toBytes()]),
   /** A Bitcoin wallet's SOL deposit address (NEAR's recipient; a plain system account). */
   btcSol: (taprootKey: Uint8Array) => find([enc('btc_sol'), taprootKey]),
   solSwap: () => find([enc('sol_swap')]),
@@ -184,6 +202,9 @@ export const pda = {
   /** A Bitcoin transaction proven for a pool (`prove_coin_spend`, once). */
   proven: (pool: PublicKey, txid: Uint8Array) =>
     find([enc('proven'), pool.toBytes(), txid]),
+  /** A block older than the relay's ring, remembered (`remember_block`). */
+  knownBlock: (relay: PublicKey, height: number) =>
+    find([enc('block'), relay.toBytes(), le(height, 4)]),
   coin: (pool: PublicKey, txid: Uint8Array, vout: number) =>
     find([enc('coin'), pool.toBytes(), txid, le(vout, 4)]),
 };

@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@etchydotfun/rune-pool?color=cb3837)](https://www.npmjs.com/package/@etchydotfun/rune-pool)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-![Network](https://img.shields.io/badge/network-devnet-f5a623)
+![Network](https://img.shields.io/badge/network-mainnet-14f195)
 
 TypeScript SDK for [Etchy Zero](https://etchy.fun), an automated market maker for Bitcoin Runes
 on Solana.
@@ -16,16 +16,23 @@ This package gives you the same access etchy.fun has: market data, exact quotes,
 Solana and Bitcoin wallets, moving Runes and BTC between the two chains, and the keeper that keeps
 pools in step with Bitcoin.
 
-> **Status:** live on Solana devnet for testing, not yet deployed on mainnet. Trades on devnet use
-> test SOL and test WBTC; Bitcoin transactions (launches, deposits, payouts) are real.
+> **Status:** live on Solana mainnet. New launches are open to a short list of wallets while the
+> first ones are tested. Devnet stays up for testing: trades there use test SOL and test WBTC,
+> while its Bitcoin transactions (launches, deposits, payouts) are real. Addresses for both are
+> under [Networks](#networks).
 
 ## How it works
 
 **Pools.** Each pool holds one Rune and trades it against WBTC on a constant-product bonding curve.
-A virtual BTC reserve sets the starting market cap (0.035 BTC on devnet), and the curve remains
-the market for the life of the pool. A pool opens only when someone proves its Rune's etching: the
-entire premine must be paid to the pool's vault, with no open mint. On mainnet, pools exist only
-for new Runes etched directly into their vault.
+A virtual BTC reserve sets the starting market cap (0.035 BTC), and the curve remains the market
+for the life of the pool. A pool opens only when someone proves its Rune's etching: the entire
+premine must be paid to the pool's vault, with no open mint. On mainnet, pools exist only for new
+Runes etched directly into their vault.
+
+**First buys.** A launch can reserve a pool's first trade for its creator. Until that buy is made,
+or its deadline passes, nobody else can trade, so the creator buys at the starting price. On
+etchy.fun the creator pays for it together with the launch; it is made as soon as trading opens,
+or paid back if the launch fails.
 
 **Balances.** Holdings are accounts in the `rune_pool` program, keyed by owner. They support
 transfers and delegated approvals like token balances, but they are not SPL tokens. An owner is
@@ -96,7 +103,7 @@ from any site.
 ```ts
 import { createEtchyApi } from '@etchydotfun/rune-pool';
 
-const api = createEtchyApi('https://api.etchy.fun/rune-pools');
+const api = createEtchyApi('https://api.etchy.fun/zero'); // devnet: /rune-pools
 
 const pools = await api.pools({ sort: 'volume' });
 const pool = await api.pool('971505:1052'); // a Rune ID, a Rune name or a pool address
@@ -112,6 +119,9 @@ const live = api.stream((t) => console.log(t.side, t.btcAmount), { pool: pool.po
 
 The same data can be read from the chain alone with `createPoolIndexer({ connection })`, with no
 Etchy server involved. See `examples/read-devnet.ts`.
+
+The examples below use devnet, where pools exist to try things with test funds. On mainnet the
+code is the same with a mainnet RPC and `https://api.etchy.fun/zero`.
 
 ### Trading from a Solana wallet
 
@@ -188,9 +198,10 @@ const { signature: tx } = await api.trade({
 The wallet is asked to sign text like this:
 
 ```text
-Etchy Rune Pools (devnet): buy ETCHY•FUN (Rune 971505:1052) with 0.00010000 BTC of my Etchy
+Etchy Zero (devnet): buy ETCHY•FUN (Rune 971505:1052) with 0.00010000 BTC of my Etchy
 balance, for at least 2942836.740124 ETCHY•FUN.
 Order 2, valid until 1792611734 (unix time).
+Solana program D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU.
 ```
 
 The signature covers these exact bytes, so always use the text returned by the relay or built by
@@ -219,7 +230,8 @@ BTC enters and leaves through NEAR Intents, never through an Etchy wallet.
 
 ## HTTP API
 
-Base URL: `https://api.etchy.fun/rune-pools` (devnet). Amounts are strings in base units. Errors
+Base URL: `https://api.etchy.fun/zero` on mainnet and `https://api.etchy.fun/rune-pools` on devnet,
+with the same paths. Amounts are strings in base units. Errors
 are returned as `{ "error": "CODE" }` with an HTTP status; `RPC_BUSY` (503) means Solana's RPC
 was briefly unavailable, and the request can be retried. Each IP address may make 600 GET and 60
 POST requests per minute and hold 10 open streams.
@@ -253,9 +265,9 @@ POST requests per minute and hold 10 open streams.
 
 | Area | Functions |
 | --- | --- |
-| Reads (`createRunePoolClient`) | `getConfig`, `listPools`, `getPool`, `poolOfRune`, `getBalance`, `balancesOf`, `fees`, `getVault`, `bitcoinWallet` |
+| Reads (`createRunePoolClient`) | `getConfig`, `listPools`, `getPool`, `poolOfRune`, `getBalance`, `balancesOf`, `fees`, `feeRouteOf`, `getVault`, `bitcoinWallet` |
 | Quotes | `quote`, `quoteExactOut`, `quoteOnChain` |
-| Trades and balances | `buy`, `sell`, `transferRunes`, `approve`, `closeBalance` |
+| Trades and balances | `buy`, `sell`, `transferRunes`, `approve`, `closeBalance`, `claimRouteFees` |
 | Bitcoin-wallet orders | `btcTradeOrder`, `btcTrade`, `btcApproveOrder`, `btcApprove`, `btcSendWbtcOrder`, `btcSendWbtc`, `bip322Signature` |
 | Withdrawals and deposits | `requestWithdrawal`, `withdrawalsOf`, `getWithdrawal`, `cancelWithdrawal`, `closeWithdrawal`, `depositInfo` |
 | History and live data | `tradesOf`, `recentTrades`, `createPoolIndexer`, `subscribeTrades`, `tradesFromLogs`, `poolStats` |
@@ -288,17 +300,23 @@ const keeper = createKeeper({
 setInterval(() => keeper.tick().catch(console.error), 60_000);
 ```
 
-`examples/keeper-devnet.ts` is a complete, runnable version.
+`examples/keeper-devnet.ts` is a complete, runnable version. On mainnet, pass
+`{ canisterId: MAINNET_VAULT_CANISTER }` to `createVaultCanister` and use `MAINNET_LOOKUP_TABLE`.
 
 ## Networks
 
-| | Devnet |
-| --- | --- |
-| `rune_pool` program | `D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU` |
-| `btc_relay` program | `9enwiwQwfPH5FSjcSo1fDViJwM8kQn5LpsrEq3uKXrbY` |
-| HTTP API | `https://api.etchy.fun/rune-pools` |
+The programs have the same addresses on both networks.
 
-Mainnet addresses will be published here at launch.
+| | Mainnet | Devnet |
+| --- | --- | --- |
+| `rune_pool` program | [`D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU`](https://solscan.io/account/D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU) | [the same](https://solscan.io/account/D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU?cluster=devnet) |
+| `btc_relay` program | [`9enwiwQwfPH5FSjcSo1fDViJwM8kQn5LpsrEq3uKXrbY`](https://solscan.io/account/9enwiwQwfPH5FSjcSo1fDViJwM8kQn5LpsrEq3uKXrbY) | [the same](https://solscan.io/account/9enwiwQwfPH5FSjcSo1fDViJwM8kQn5LpsrEq3uKXrbY?cluster=devnet) |
+| Relay account (Bitcoin headers) | [`8jiPVfMUbrEFgbiB8CT2k5ZFrYui6kwQcnHaKpb6Zgxe`](https://solscan.io/account/8jiPVfMUbrEFgbiB8CT2k5ZFrYui6kwQcnHaKpb6Zgxe) | [`Cdn6GTeretnh72LEgTPKbP42yauqRzxtMzqdpHkeA4Tz`](https://solscan.io/account/Cdn6GTeretnh72LEgTPKbP42yauqRzxtMzqdpHkeA4Tz?cluster=devnet) |
+| Vault canister (Internet Computer) | [`j22zd-eyaaa-aaaao-qqkza-cai`](https://dashboard.internetcomputer.org/canister/j22zd-eyaaa-aaaao-qqkza-cai) (`MAINNET_VAULT_CANISTER`) | [`rdl3p-uqaaa-aaaaa-qhvpq-cai`](https://dashboard.internetcomputer.org/canister/rdl3p-uqaaa-aaaaa-qhvpq-cai) (`DEVNET_VAULT_CANISTER`) |
+| Lookup table | [`C6DTPV3SKeunnPvtbbzZbjLNFG2u5nhFN2ognYiyUN4g`](https://solscan.io/account/C6DTPV3SKeunnPvtbbzZbjLNFG2u5nhFN2ognYiyUN4g) (`MAINNET_LOOKUP_TABLE`) | [`9drGTuME311J1BoYDVeNc5QSK4RpuH4kp8T8Uv1tHNgV`](https://solscan.io/account/9drGTuME311J1BoYDVeNc5QSK4RpuH4kp8T8Uv1tHNgV?cluster=devnet) (`DEVNET_LOOKUP_TABLE`) |
+| Quote token | WBTC (Wormhole) `3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh` | a test token |
+| Bitcoin proofs | 6 confirmations | 2 confirmations |
+| HTTP API | `https://api.etchy.fun/zero` | `https://api.etchy.fun/rune-pools` |
 
 ## Examples
 
@@ -315,6 +333,24 @@ node --experimental-strip-types examples/read-devnet.ts   # Node.js 22.6 or late
 
 To build the package from source, run `npm run build`. It compiles to `dist/` and then checks
 that the output loads in Node.js and bundles for the browser.
+
+## Changes
+
+**0.3.0**
+
+- Mainnet: `MAINNET_VAULT_CANISTER`, `MAINNET_LOOKUP_TABLE` and the addresses above.
+- Early trading: a new pool can trade before its etching is proven (`POOL_EARLY`, `pool.early`,
+  `pool.earlyUntil`, `pool.proven`). Runes move to and from Bitcoin only after the proof.
+- First buys: `pool.firstBuy` (amount, buyer and deadline), from the chain and from the API.
+- Fee routes: `feeRouteOf` and `claimRouteFees` (anyone can pay out a routed pool's creator
+  fees), and `feeRoute` in the API.
+- Keeper: proofs keep working for blocks the relay no longer holds (`rememberBlock`), Runes
+  added to a spend that was already proven are credited by a second proof
+  (`reprove_coin_spend`), and the vault's withdrawal fee follows Bitcoin fees (`withdrawalFee`).
+  Keepers must upgrade: the program's proof instructions changed.
+- `closeBalance` returns the rent to whoever paid it.
+- Messages signed by Bitcoin wallets start with `Etchy Zero (mainnet)` or `Etchy Zero (devnet)`
+  and end with the program's address. Build them with `tradeMessage` and `approveMessage`.
 
 ## License
 

@@ -1,6 +1,7 @@
 import {
   ComputeBudgetProgram,
   Connection,
+  Keypair,
   PublicKey,
   SystemProgram,
   TransactionInstruction,
@@ -69,6 +70,8 @@ export const ATA_PROGRAM = new PublicKey(
 );
 export const POOL_PENDING = 0;
 export const POOL_ACTIVE = 1;
+/** A launch pool trading before Bitcoin's proof of its etching (no Runes out yet). */
+export const POOL_EARLY = 2;
 
 /** A wallet's associated token account. */
 export const tokenAccount = (owner: PublicKey, mint: PublicKey) =>
@@ -96,6 +99,22 @@ export function createTokenAccountIx(
   });
 }
 
+/** SPL Token `InitializeAccount3`: `account` (created for the token program) holds `mint` for `owner`. */
+export function initializeTokenAccountIx(
+  account: PublicKey,
+  mint: PublicKey,
+  owner: PublicKey,
+) {
+  return new TransactionInstruction({
+    programId: TOKEN_PROGRAM,
+    keys: [
+      { pubkey: account, isSigner: false, isWritable: true },
+      { pubkey: mint, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([Buffer.from([18]), Buffer.from(owner.toBytes())]),
+  });
+}
+
 /** One fee mode: each side's fee and the creator's part (bps); the rest is Etchy's. */
 export interface FeeMode {
   enabled: boolean;
@@ -110,7 +129,7 @@ export interface PoolConfig {
   paused: boolean;
   modes: FeeMode[];
   poolCount: bigint;
-  /** What every signed message names ("Etchy Rune Pools (mainnet):"). */
+  /** What every signed message names ("Etchy Zero (mainnet):"). */
   network: PoolNetwork;
   /** Only new launches get pools (never undone). */
   launchOnly: boolean;
@@ -125,7 +144,13 @@ export interface PoolState extends RuneLabel {
   symbol: string | null;
   supply: bigint;
   status: number;
+  /** It trades: proven, or early (see `early`). */
   active: boolean;
+  /** Bitcoin's proof is in: the supply is in the vault, Runes go out to Bitcoin and come back. */
+  proven: boolean;
+  /** Trading before the proof: no Runes out yet; buys stop at `earlyUntil` (unix seconds) unless proven by then. */
+  early: boolean;
+  earlyUntil: number | null;
   paused: boolean;
   reserves: Reserves;
   mode: number;
@@ -141,6 +166,20 @@ export interface PoolState extends RuneLabel {
   launchKey: Uint8Array | null;
   /** Sats per whole Rune, 18 decimals. */
   priceE18: bigint;
+  /**
+   * The creator's first buy (sats) and who gets it: until it is made, or
+   * `firstBuyUntil` (unix seconds) passes, nobody trades. Null: none (or made).
+   */
+  firstBuy: { sats: bigint; buyer: PublicKey; until: number } | null;
+  /** Its creator fees follow its fee route (`feeRouteOf`): anyone pays them out. */
+  feeRouted: boolean;
+}
+export interface FeeRouteState {
+  pool: PublicKey;
+  /** Owners (a Solana wallet, or a Bitcoin wallet's owner address) and shares (bps). */
+  entries: { owner: PublicKey; bps: number }[];
+  /** Creator fees paid out through it, ever (sats). */
+  paid: bigint;
 }
 export interface RuneBalanceState {
   address: PublicKey;
@@ -227,7 +266,11 @@ function poolState(address: PublicKey, p: Raw): PoolState {
     symbol: sym ? String.fromCodePoint(sym) : null,
     supply: p.supply as bigint,
     status: p.status as number,
-    active: p.status === POOL_ACTIVE,
+    active: p.status === POOL_ACTIVE || p.status === POOL_EARLY,
+    proven: p.status === POOL_ACTIVE,
+    early: p.status === POOL_EARLY,
+    earlyUntil:
+      p.status === POOL_EARLY ? Number(p.early_until as bigint) : null,
     paused: p.paused as boolean,
     reserves,
     mode: p.mode as number,
@@ -240,6 +283,15 @@ function poolState(address: PublicKey, p: Raw): PoolState {
     volumeBtc: p.volume_btc as bigint,
     launchKey: lk.every((b) => b === 0) ? null : lk,
     priceE18: priceE18(reserves, label.divisibility),
+    firstBuy:
+      (p.first_buy as bigint) > 0n
+        ? {
+            sats: p.first_buy as bigint,
+            buyer: p.first_buyer as PublicKey,
+            until: Number(p.first_buy_until as bigint),
+          }
+        : null,
+    feeRouted: p.fee_routed as boolean,
   };
 }
 
@@ -552,6 +604,112 @@ export function createRunePoolClient(o: {
     ];
   }
 
+  // ------------------------------------------------------------ creator fees
+  /** A pool's fee route (null: none; its creator fees are Etchy's to pay to holders). */
+  async function feeRouteOf(pool: PublicKey): Promise<FeeRouteState | null> {
+    const a = await account(pda.feeRoute(pool));
+    if (!a) return null;
+    const r = decodeAccount<Raw>('FeeRoute', a.data);
+    const n = r.count as number;
+    if (!n) return null;
+    return {
+      pool,
+      entries: (r.entries as Raw[]).slice(0, n).map((e) => ({
+        owner: e.owner as PublicKey,
+        bps: e.bps as number,
+      })),
+      paid: r.paid as bigint,
+    };
+  }
+  /**
+   * Anyone: pays a routed pool's creator fees to its owners' WBTC accounts
+   * (`payer` creates the missing ones and pays the Solana fee). Etchy is
+   * not needed: the program sends each owner its share.
+   *
+   * An owner whose associated WBTC account now belongs to another key (it
+   * gave it away) is paid into another WBTC account of its own (one it has,
+   * or a new one the payer creates: its key is in `.signers`, the
+   * transaction needs it), the given one following as the program's proof.
+   */
+  async function claimRouteFees(p: {
+    pool: PublicKey;
+    payer: PublicKey;
+    /** Create missing WBTC accounts (default: yes; the payer pays their rent). */
+    createAccounts?: boolean;
+  }): Promise<TransactionInstruction[] & { signers: Keypair[] }> {
+    const cfg = await getConfig();
+    const route = await feeRouteOf(p.pool);
+    if (!route) throw new Error('this pool has no fee route');
+    const create = p.createAccounts !== false;
+    const before: TransactionInstruction[] = [];
+    const signers: Keypair[] = [];
+    const rest: PublicKey[] = [];
+    for (const e of route.entries) {
+      const ata = tokenAccount(e.owner, cfg.quoteMint);
+      const a = await account(ata);
+      const holder =
+        a && a.owner.equals(TOKEN_PROGRAM) && a.data.length >= 64
+          ? new PublicKey(Uint8Array.from(a.data).subarray(32, 64))
+          : null;
+      if (!holder || holder.equals(e.owner)) {
+        if (!a && create)
+          before.push(createTokenAccountIx(p.payer, e.owner, cfg.quoteMint));
+        rest.push(ata);
+        continue;
+      }
+      // Its associated account belongs to another key now (audit A1-01).
+      const own = (
+        await conn.getTokenAccountsByOwner(
+          e.owner,
+          { mint: cfg.quoteMint },
+          'confirmed',
+        )
+      ).value.find(
+        (x) =>
+          !x.pubkey.equals(ata) &&
+          new PublicKey(
+            Uint8Array.from(x.account.data).subarray(32, 64),
+          ).equals(e.owner),
+      );
+      let to = own?.pubkey;
+      if (!to) {
+        if (!create)
+          throw new Error(
+            `${e.owner.toBase58()} gave its WBTC account away: a new one is needed (createAccounts)`,
+          );
+        const k = Keypair.generate();
+        signers.push(k);
+        before.push(
+          SystemProgram.createAccount({
+            fromPubkey: p.payer,
+            newAccountPubkey: k.publicKey,
+            lamports: await conn.getMinimumBalanceForRentExemption(165),
+            space: 165,
+            programId: TOKEN_PROGRAM,
+          }),
+          initializeTokenAccountIx(k.publicKey, cfg.quoteMint, e.owner),
+        );
+        to = k.publicKey;
+      }
+      rest.push(to, ata);
+    }
+    const ixs = [
+      ...before,
+      instruction(
+        'claim_route_fees',
+        {},
+        {
+          config: pda.config(),
+          pool: p.pool,
+          vault: pda.vault(p.pool),
+          route: pda.feeRoute(p.pool),
+        },
+        rest.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true })),
+      ),
+    ];
+    return Object.assign(ixs, { signers });
+  }
+
   // ------------------------------------------------------------ Bitcoin
   async function getVault(pool: PublicKey): Promise<VaultState | null> {
     const a = await account(pda.btcVault(pool));
@@ -861,13 +1019,32 @@ export function createRunePoolClient(o: {
       ),
     ];
   }
-  /** Closes an EMPTY balance: its rent goes back to the owner. */
-  function closeBalance(p: { pool: PublicKey; owner: PublicKey }) {
+  /**
+   * Closes an EMPTY balance, signed by its owner or by whoever paid its rent
+   * (`closer`; a Bitcoin wallet's balance can only be closed that way). The
+   * rent goes back to whoever paid it, as the balance records (the owner
+   * for balances opened before the payer was recorded).
+   */
+  async function closeBalance(p: {
+    pool: PublicKey;
+    owner: PublicKey;
+    /** Who signs (default: the owner). */
+    closer?: PublicKey;
+  }) {
+    const balance = pda.balance(p.pool, p.owner);
+    const a = await account(balance);
+    if (!a) throw new Error('no such balance');
+    const b = decodeAccount<Raw>('RuneBalance', a.data);
+    const payer = b.rent_payer as PublicKey;
     return [
       instruction(
         'close_balance',
         {},
-        { owner: p.owner, balance: pda.balance(p.pool, p.owner) },
+        {
+          closer: p.closer ?? p.owner,
+          balance,
+          rent_to: payer.equals(PublicKey.default) ? p.owner : payer,
+        },
       ),
     ];
   }
@@ -1361,6 +1538,8 @@ export function createRunePoolClient(o: {
     buy,
     sell,
     transferRunes,
+    feeRouteOf,
+    claimRouteFees,
     getVault,
     requestWithdrawal,
     depositInfo,

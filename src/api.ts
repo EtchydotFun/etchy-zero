@@ -16,8 +16,18 @@ export interface ApiPool {
   meta: ApiPoolMeta | null;
   divisibility: number;
   supply: string;
+  /** It trades (proven, or early). */
   active: boolean;
+  /** Bitcoin's proof is in: Runes go out to Bitcoin and come back. */
+  proven: boolean;
+  /** Trading before the proof; buys stop at `earlyUntil` (unix seconds) unless proven by then. */
+  early: boolean;
+  earlyUntil: number | null;
   paused: boolean;
+  /** Its creator fees follow its own route (`feeRoute`): anyone pays them out. */
+  feeRouted?: boolean;
+  /** Its first trade is kept for its creator until `until` (unix seconds): nobody trades before. */
+  firstBuy?: { sats: string; until: number } | null;
   btcReal: string;
   btcVirtual: string;
   runeReserve: string;
@@ -55,9 +65,9 @@ export interface ApiPoolMeta {
   website: string | null;
   image: string | null;
   solanaMint: string | null;
-  /** Who gets the creator part of the fees (inscribed): its holders, or Bitcoin addresses. */
-  fees: 'HOLDERS' | 'ROUTED' | null;
-  /** ROUTED: the Bitcoin addresses and their shares (basis points, adding up to 10,000). */
+  /** Who gets the creator part of the fees (inscribed): its holders, chosen wallets, or its creator. */
+  fees: 'HOLDERS' | 'ROUTED' | 'CREATOR' | null;
+  /** ROUTED / CREATOR: the wallets and their shares at launch (basis points, adding up to 10,000). */
   feeRoute: ApiFeeRouteEntry[] | null;
   /** The wallet that launched the Rune (inscribed), and what it paid with. */
   deployer: string | null;
@@ -68,6 +78,24 @@ export interface ApiPoolMeta {
 export interface ApiFeeRouteEntry {
   address: string;
   bps: number;
+}
+/**
+ * Where a pool's creator fees go now (its own route on Solana; Etchy may
+ * hand it over, a CTO). Anyone pays them out: `claimFees`, or the SDK's
+ * `claimRouteFees` with any wallet.
+ */
+export interface ApiFeeRoute {
+  pool: string;
+  feeRouted: boolean;
+  unclaimedSats: string;
+  route: {
+    /** owner: a Solana wallet, or a Bitcoin wallet's owner (then its bc1p). */
+    entries: { owner: string; bps: number; bitcoinAddress: string | null }[];
+    paidSats: string;
+  } | null;
+  firstBuy: { sats: string; buyer: string; until: number } | null;
+  /** Etchy pays it out every 10 minutes from this much. */
+  autoClaimMinSats: string;
 }
 /** One holder's part of a pool's fee rewards (sats). */
 export interface ApiRewardEntry {
@@ -458,6 +486,9 @@ export function createEtchyApi(baseUrl: string, f: typeof fetch = fetch) {
       call<ApiBitcoinHolders>(`/v1/pools/${pool}/bitcoin-holders`),
     /** The pool's fee rewards: who gets them, owed, paid, waiting, the next round. */
     rewards: (pool: string) => call<ApiRewards>(`/v1/pools/${pool}/rewards`),
+    /** Where the pool's creator fees go now (its own route), and its first buy. */
+    feeRoute: (pool: string) =>
+      call<ApiFeeRoute>(`/v1/pools/${pool}/fee-route`),
     /** The full URL of an API path (for example a pool's `meta.logo`). */
     url: (path: string) => `${base}${path.startsWith('/') ? '' : '/'}${path}`,
     /** A wallet's withdrawals to Bitcoin (a Solana or bc1p address), newest first. */
@@ -637,7 +668,10 @@ export function createEtchyApi(baseUrl: string, f: typeof fetch = fetch) {
         toleranceBps: number;
         wbtcAccount: string;
       }>(`/v1/wallets/${bitcoinAddress}/near`),
-    /** After paying NEAR: Etchy's keeper watches the deposit and swaps it. */
+    /**
+     * After paying NEAR: Etchy's keeper watches the deposit and swaps it
+     * (for a wallet that asked `nearAdd` within the last 2 hours).
+     */
     watchNearAdd: (bitcoinAddress: string) =>
       call<{ watching: boolean; depositSol: string }>('/v1/sol-swap/watch', {
         bitcoinAddress,

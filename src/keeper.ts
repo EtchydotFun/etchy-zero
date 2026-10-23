@@ -35,7 +35,13 @@
  *       it). An output at the vault address is a deposit, owned by the memo's
  *       Solana key;
  *     - a deposit with an owner: `credit_deposit` (its Runes in the owner's
- *       pool balance).
+ *       pool balance);
+ *     - a known coin whose spender was proven before the coin was known
+ *       (it counted zero then): `reprove_coin_spend` adds it (a spent
+ *       output gets a top-up record, re-proven the same way down the chain).
+ *  4. A proof of a block older than the relay's ring (keeper outage of 2+
+ *     weeks): the block is remembered first (`remember_block`, its headers
+ *     to a block the relay has, in steps), then proven as usual.
  *
  * Failures wait (retry later) and never repeat a canister call in a loop.
  * Pure logic: the chain, Bitcoin, the vault canister and the store are passed in.
@@ -70,10 +76,28 @@ export const M83_POOL_RELAYER_POLICY = Object.freeze({
   /** The program's limits of `prove_coin_spend` (every input counts). */
   maxCoinInputs: 12,
   maxCoinOutputs: 8,
+  /** `remember_block`: headers per step (the program takes up to 4,000). */
+  rememberStep: 2_000,
+  /** ...leading to a block this far above the bottom of the relay's ring. */
+  rememberMargin: 12,
+  /** The vault canister is asked to set the withdrawal fee this often (it moves it at most every 30 min). */
+  withdrawalFeeSeconds: 900,
+  /** A batch that waits for Bitcoin fees (`WaitingUntil`) is asked again by then, within this at most. */
+  waitingRetryMaxSeconds: 3_600,
 });
+/**
+ * `ProvenTx.units` of a vault transaction (`prove_vault_spend` marks it):
+ * never a coin spend, so never offered as one (the program refuses it).
+ */
+export const VAULT_TX_UNITS = (1n << 128n) - 1n;
 export type M83PoolRelayerPolicy = typeof M83_POOL_RELAYER_POLICY;
 
+/** btc-relay's RING: the blocks it keeps. */
+const RELAY_RING = 2048;
+
 const POOL_PENDING = 0;
+const POOL_ACTIVE = 1;
+const POOL_EARLY = 2;
 
 export interface RelayerVault {
   /** The vault output script (hex). */
@@ -167,6 +191,35 @@ export interface PoolRelayerChain {
   /** This transaction was already proven for this pool (`ProvenTx`). */
   proven(pool: string, txid: string): Promise<boolean>;
   /**
+   * The Rune units its proof counted so far (`ProvenTx.units`); null: not
+   * proven, or proven before re-proofs existed (cannot be re-proven).
+   */
+  provenUnits(pool: string, txid: string): Promise<bigint | null>;
+  /**
+   * A proven transaction again, with the input records there are now
+   * (`reprove_coin_spend`): `outputs` get Runes under the new count.
+   */
+  reproveCoinSpend(
+    pool: string,
+    proof: RelayerProof,
+    inputs: { txid: string; vout: number }[],
+    outputs: number[],
+  ): Promise<string>;
+  /**
+   * A block older than the relay's ring is remembered (`KnownBlock`); every
+   * proof method adds it itself when the relay no longer has its block.
+   */
+  remembered(height: number): Promise<boolean>;
+  /**
+   * `remember_block(height)` with `headers` (80 bytes each, from `height`
+   * up): the last one a block the relay has, or the remembered `anchor`.
+   */
+  rememberBlock(
+    height: number,
+    headers: Uint8Array[],
+    anchor: number | null,
+  ): Promise<string>;
+  /**
    * `inputs`: EVERY input of the transaction, in order (display txid; the
    * program counts the known ones, each once); `outputs`: vouts that get
    * Runes, increasing.
@@ -214,6 +267,12 @@ export interface PoolRelayerVault {
     pool: string,
     feeRate: number,
   ): Promise<{ txid: string; feeRate: number; version: number }>;
+  /**
+   * The canister sets the program's withdrawal fee to what a withdrawal
+   * costs at the Bitcoin fee rate now (`set_withdrawal_fee`, sent): its
+   * signature. `FEE_UNCHANGED` / `FEE_SET_RECENTLY`: nothing to do.
+   */
+  withdrawalFee?(): Promise<string>;
 }
 export interface RelayerRecord {
   /** The vault is (true) or is not (false) this canister's; unknown if absent. */
@@ -422,6 +481,37 @@ export function createPoolRelayer(d: {
       Math.max(p.minFeeRate, Math.ceil(await d.bitcoin.feeRate())),
     );
 
+  /**
+   * Blocks the relay no longer keeps (older than its 2,048-block ring) are
+   * remembered first: their headers lead to a block the relay has (steps of
+   * `rememberStep` headers, each remembered block the anchor of the next).
+   */
+  async function ensureKept(heights: number[]): Promise<void> {
+    for (const h of [...new Set(heights)].sort((a, b) => b - a)) {
+      if ((await d.chain.relayHash(h)) !== null) continue;
+      if (await d.chain.remembered(h)) continue;
+      const tip = await d.chain.relayTip();
+      // A block the relay has, deep enough that no fork replaces it.
+      let top = tip - RELAY_RING + 1 + p.rememberMargin;
+      if (h >= top)
+        throw new Error(`block ${h}: neither kept nor older than the ring`);
+      let anchor: number | null = null;
+      while (top > h) {
+        const from = Math.max(h, top - p.rememberStep + 1);
+        if (!(await d.chain.remembered(from))) {
+          const hs = await d.bitcoin.headers(from, top);
+          const sig = await d.chain.rememberBlock(from, hs, anchor);
+          log(
+            `block ${from} remembered (${hs.length} headers to ${anchor === null ? 'the relay' : `block ${anchor}`}) (${sig})`,
+          );
+        }
+        anchor = from;
+        top = from;
+        if (from === h) break;
+      }
+    }
+  }
+
   /** One pool: at most one action per tick. */
   async function step(
     pool: RelayerPool,
@@ -452,7 +542,8 @@ export function createPoolRelayer(d: {
     if (v.alarm) return;
 
     if (!v.hasCoin) {
-      if (pool.status !== POOL_PENDING) return;
+      // Pending, or trading early: the etching's proof opens it fully.
+      if (pool.status !== POOL_PENDING && pool.status !== POOL_EARLY) return;
       if (tip - Number(pool.runeBlock) + 1 < minConf) return;
       const txid = await d.bitcoin.txidAt(Number(pool.runeBlock), pool.runeTx);
       const named =
@@ -460,6 +551,7 @@ export function createPoolRelayer(d: {
       if (named) {
         const np = await d.bitcoin.namedProof(txid, pool.runeName);
         if (!np) throw new Error(`no name commitment found for ${txid}`);
+        await ensureKept([Number(pool.runeBlock), np.commitHeight]);
         const sig = await d.chain.activateNamed(pool.pool, np);
         log(
           `${name}: activated by the proof of its etching ${txid} and its name's commitment (commit at ${np.commitHeight}:${np.commitIndex}, ${np.payload.length}-byte proof) (${sig})`,
@@ -468,6 +560,7 @@ export function createPoolRelayer(d: {
       }
       const proof = await d.bitcoin.prove(txid);
       if (!proof) return;
+      await ensureKept([proof.height]);
       const sig = await d.chain.activate(pool.pool, proof);
       log(`${name}: activated by the proof of its etching ${txid} (${sig})`);
       return;
@@ -498,6 +591,7 @@ export function createPoolRelayer(d: {
         (c) =>
           c.deposit && ins.some((i) => i.txid === c.txid && i.vout === c.vout),
       );
+      await ensureKept([proof.height]);
       const sig = await d.chain.proveVaultSpend(pool.pool, proof, ids, others);
       log(
         `${name}: batch ${v.batch} proven on Bitcoin (${spent.txid}): ${ids.length} withdrawal(s)${sweeps.length ? `, ${sweeps.length} deposit(s) swept` : ''} (${sig})`,
@@ -534,7 +628,7 @@ export function createPoolRelayer(d: {
   ): Promise<void> {
     const name = short(pool.pool);
     const v = pool.vault;
-    if (!v || v.alarm || pool.status === POOL_PENDING) return;
+    if (!v || v.alarm || pool.status !== POOL_ACTIVE) return;
     const dkey = `deposits:${pool.pool}`;
     const drec = (await d.store.get(dkey)) ?? {};
     if (drec.retryAt && now() < drec.retryAt) return;
@@ -582,11 +676,23 @@ export function createPoolRelayer(d: {
         await d.store.put(tkey, { stuck: true, lastError: why });
         log(`${name}: ${s.txid} cannot be proven: ${why}`);
       };
+      // Proven before this coin was known (it counted zero then): proven
+      // again with it (audit A2-02), what it adds goes to its outputs.
+      let before: bigint | null = null;
       if (await d.chain.proven(pool.pool, s.txid)) {
-        await stuck(
-          `proven before without ${c.txid}:${c.vout} (its Runes stay unknown)`,
-        );
-        continue;
+        before = await d.chain.provenUnits(pool.pool, s.txid);
+        if (before === null) {
+          await stuck(
+            `proven before re-proofs existed, without ${c.txid}:${c.vout} (its Runes stay unknown)`,
+          );
+          continue;
+        }
+        // A vault transaction (proven by prove_vault_spend): never a coin
+        // spend, the program refuses it (audit A1-02). Not asked again.
+        if (before === VAULT_TX_UNITS) {
+          await stuck('a vault transaction (proven as one)');
+          continue;
+        }
       }
       const proof = await d.bitcoin.prove(s.txid);
       if (!proof) continue;
@@ -603,7 +709,8 @@ export function createPoolRelayer(d: {
         );
         continue;
       }
-      const units = ins.reduce((a, f) => a + f.runes, 0n);
+      const added = ins.reduce((a, f) => a + f.runes, 0n);
+      const units = (before ?? 0n) + added;
       const alloc = allocateRune(
         tx.outputs,
         decipherRunestone(tx.outputs),
@@ -617,17 +724,39 @@ export function createPoolRelayer(d: {
         );
         continue;
       }
-      const sig = await d.chain.proveCoinSpend(
-        pool.pool,
-        proof,
-        tx.inputs,
-        outs,
-      );
+      await ensureKept([proof.height]);
+      const sig =
+        before === null
+          ? await d.chain.proveCoinSpend(pool.pool, proof, tx.inputs, outs)
+          : await d.chain.reproveCoinSpend(pool.pool, proof, tx.inputs, outs);
       left--;
       const burned = units - alloc.reduce((a, u) => a + u, 0n);
       log(
-        `${name}: Runes moved on Bitcoin ${s.txid}: ${units} units from ${ins.length} known coin(s) -> output(s) ${outs.join(', ') || 'none'}${burned > 0n ? `, ${burned} burned` : ''} (${sig})`,
+        before === null
+          ? `${name}: Runes moved on Bitcoin ${s.txid}: ${units} units from ${ins.length} known coin(s) -> output(s) ${outs.join(', ') || 'none'}${burned > 0n ? `, ${burned} burned` : ''} (${sig})`
+          : `${name}: ${s.txid} proven again: +${added} units from ${ins.length} coin(s) known since (${units} in all) -> output(s) ${outs.join(', ') || 'none'} (${sig})`,
       );
+    }
+  }
+
+  /**
+   * The vault canister keeps the program's withdrawal fee at what a
+   * withdrawal costs at the Bitcoin fee rate (audit A3-10): asked every
+   * `withdrawalFeeSeconds`; it changes the fee only when it is well off.
+   */
+  async function withdrawalFee() {
+    if (!d.vault.withdrawalFee) return;
+    const key = 'withdrawal-fee';
+    const rec = (await d.store.get(key)) ?? {};
+    if (rec.retryAt && now() < rec.retryAt) return;
+    await d.store.put(key, { retryAt: now() + p.withdrawalFeeSeconds });
+    try {
+      const sig = await d.vault.withdrawalFee();
+      log(`withdrawal fee set by the vault canister (${sig})`);
+    } catch (e) {
+      const code = msg(e);
+      if (!/^(FEE_UNCHANGED|FEE_SET_RECENTLY)/.test(code))
+        log(`withdrawal fee: ${code}`);
     }
   }
 
@@ -639,6 +768,7 @@ export function createPoolRelayer(d: {
       log(`headers: ${msg(e)}`);
       tip = await d.chain.relayTip();
     }
+    await withdrawalFee();
     const minConf = await d.chain.minConfirmations();
     for (const pool of await d.chain.pools()) {
       if ((await d.store.get(`pool:${pool.pool}`))?.ours === true)
@@ -663,11 +793,19 @@ export function createPoolRelayer(d: {
         const code = msg(e);
         // The canister refuses vaults that are not its key: never ask again.
         if (/NOT_THIS_CANISTERS_VAULT/.test(code)) rec.ours = false;
-        rec.retryAt = now() + p.retrySeconds;
+        // A batch worth starting later (its requests' fees do not cover it
+        // yet, A3-10): asked again then, within the hour.
+        const until = /WaitingUntil\("[A-Z_]+",\s*(\d+)\)/.exec(code);
+        rec.retryAt = until
+          ? Math.min(
+              Math.max(Number(until[1]), now() + p.retrySeconds),
+              now() + p.waitingRetryMaxSeconds,
+            )
+          : now() + p.retrySeconds;
         rec.lastError = code;
         await d.store.put(key, rec);
         log(
-          `${short(pool.pool)}: ${code} (retry in ${p.retrySeconds / 60} min)`,
+          `${short(pool.pool)}: ${code} (retry in ${Math.round((rec.retryAt - now()) / 60)} min)`,
         );
       }
     }
