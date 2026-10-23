@@ -1,455 +1,321 @@
-# @etchydotfun/rune-pool
+# Etchy Zero SDK
 
-**Etchy Rune Pools**: an AMM for new Bitcoin Runes. Trade **real Runes at Solana speed**, from
-any site, wallet, bot or terminal.
+[![npm](https://img.shields.io/npm/v/@etchydotfun/rune-pool?color=cb3837)](https://www.npmjs.com/package/@etchydotfun/rune-pool)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Network](https://img.shields.io/badge/network-devnet-f5a623)
 
-- **New Runes only.** A pool exists only for a Rune launched into its own vault (the program
-  checks the etching's Bitcoin proof). Pools for existing Runes are turned off for good.
-- **Every Rune starts at the same market cap**: 0.035 BTC.
-- **BTC comes in and goes out only through NEAR Intents.** Etchy holds no Bitcoin for anyone.
+TypeScript SDK for [Etchy Zero](https://etchy.fun), an automated market maker for Bitcoin Runes
+on Solana.
 
-Every pool trades a real Rune on Bitcoin. Its Runes sit in a Bitcoin vault that no single
-party holds the key to. Trading happens inside the Rune's pool on Solana, against WBTC, so a
-buy or sale settles in about a second. When a holder wants the real Runes on Bitcoin, the pool
-pays them out of the vault. Runes sent back to the vault are credited to the sender after 1–2
-Bitcoin blocks, and the sender can sell them whenever.
+Etchy Zero trades the Rune itself, not a token that stands in for it. Each Rune's supply is held
+in a Bitcoin vault, holders' balances are accounts in the program, and trades settle on Solana in
+about a second. Whenever Runes move on Bitcoin (the etching, a payout from the vault, a deposit
+into it), the program verifies the transaction against Bitcoin's own chain before acting on it.
 
-This package does what etchy.fun does:
+This package gives you the same access etchy.fun has: market data, exact quotes, trading from
+Solana and Bitcoin wallets, moving Runes and BTC between the two chains, and the keeper that keeps
+pools in step with Bitcoin.
 
-- read pools, prices, trade history, charts, holders (in the pool and on Bitcoin) and
-  balances;
-- quote exactly what a trade will give;
-- build buy, sell, send and withdraw instructions for Solana wallets;
-- let **Bitcoin wallets** trade with no SOL: the wallet signs a plain-text order, and Etchy's
-  relay sends it;
-- move real Runes out to a Bitcoin wallet, and back into the pool.
+> **Status:** live on Solana devnet for testing, not yet deployed on mainnet. Trades on devnet use
+> test SOL and test WBTC; Bitcoin transactions (launches, deposits, payouts) are real.
 
-## Read everything (no key, no wallet)
+## How it works
 
-```ts
-import { createEtchyApi } from '@etchydotfun/rune-pool';
+**Pools.** Each pool holds one Rune and trades it against WBTC on a constant-product bonding curve.
+A virtual BTC reserve sets the starting market cap (0.035 BTC on devnet), and the curve remains
+the market for the life of the pool. A pool opens only when someone proves its Rune's etching: the
+entire premine must be paid to the pool's vault, with no open mint. On mainnet, pools exist only
+for new Runes etched directly into their vault.
 
-const api = createEtchyApi('https://api.etchy.fun/rune-pools');
+**Balances.** Holdings are accounts in the `rune_pool` program, keyed by owner. They support
+transfers and delegated approvals like token balances, but they are not SPL tokens. An owner is
+either a Solana wallet or a Bitcoin wallet; a Bitcoin wallet controls its balance with its Taproot
+key, through signed messages.
 
-const pools = await api.pools({ sort: 'volume' }); // every pool: price, market cap, 24h stats
-const pool = await api.pool('971505:1052'); // by Rune ID, Rune name (ETCHY•FUN) or address
-const { trades, next } = await api.tradesPage(pool.pool, { limit: 100 }); // newest first
-const older = await api.tradesPage(pool.pool, { limit: 100, before: next! });
-const chart = await api.candles(pool.pool, '5m'); // market cap candles in BTC and USD
-const holders = await api.holders(pool.pool); // pool balances (Bitcoin wallets by bc1p)
-const onBitcoin = await api.bitcoinHolders(pool.pool); // who holds it on Bitcoin
-const stats = await api.stats(pool.pool); // holders, 24h volume, change, all-time high
-const live = api.stream((t) => console.log(t.side, t.btcAmount), { pool: pool.pool });
-```
+**Bitcoin verification.** The `btc_relay` program is a Bitcoin light client. It accepts block
+headers from anyone and follows the chain with the most work, checking proof of work, difficulty
+adjustments and timestamps. `rune_pool` verifies Merkle proofs against the relay and applies the
+Runestone rules of `ord` to the proven transaction. This is how it learns that a Rune was etched
+into a vault, that a withdrawal was paid, or that Runes arrived in a deposit.
 
-CORS is open: browsers can call it straight from any site. The same data comes from the
-chain alone, with no Etchy server: `createPoolIndexer({ connection })` (see below and
-`examples/read-devnet.ts`).
+**The vault.** A pool's Runes sit at a Taproot address whose key is a threshold Schnorr key held
+by an Internet Computer canister. The canister signs one kind of Bitcoin transaction: a batch that
+pays the withdrawals the program has queued and returns every other Rune to the vault. Anyone can
+then prove that transaction on Solana. If a proven transaction ever leaves the vault with fewer
+Runes than the pool owes, the program halts trading in that pool and records the shortfall on
+chain.
 
-> Status: **devnet test**. The program, the vault and the API run on Solana devnet with test
-> WBTC. Addresses and URLs will change for mainnet.
+**Deposits.** Runes return to a pool when they are sent to its vault address with an `OP_RETURN`
+memo naming a Solana owner. The program follows Rune outputs from the vault outward, so it credits
+a deposit only for Runes whose history it has verified.
 
-## Fees
+## Security model
 
-Every trade pays **1.5%**, whoever sends it: etchy.fun, your site, a bot, or someone calling
-the program directly. The **program** takes the fee inside the trade itself, so no client can
-skip it. All of it is Etchy's (`pool.protocolFees`; the creator part is 0 in the default fee
-mode). Only Etchy's fee authority can claim it.
+Enforced on chain:
 
-Your platform may charge **its own fee on top**. For example, add a WBTC transfer to your own
-account in the same transaction. That fee is yours. Etchy's fee is taken either way.
+- Bitcoin data enters only as proofs against `btc_relay`. On mainnet, a pool accepts only a
+  mainnet relay that starts from a pinned checkpoint, and requires at least six confirmations.
+- Fees are taken inside each trade, at most 10% per side. No client can skip them.
+- A Bitcoin wallet's order is a readable message signed with BIP-322. It names the network, the
+  Rune, the side, the amounts, a nonce and an expiry, and it can be used once.
 
-`quote()` returns the exact fee split for each trade (`fee.total`, `fee.creator`,
-`fee.protocol`).
+Trusted today:
+
+- Etchy holds the upgrade authority of both programs and controls the vault canister. A public
+  timelock on upgrades is planned.
+- Etchy creates pools, can pause trading, and sets fee rates within the 10% cap.
+- WBTC is bridged BTC, and its backing is outside this system. NEAR Intents and Jupiter are
+  trusted to complete the swaps they quote; the program enforces the minimum amounts.
+- A Bitcoin reorganization deeper than the confirmation requirement could reverse a proven event.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Install
 
 ```bash
-npm i @etchydotfun/rune-pool @solana/web3.js
+npm install @etchydotfun/rune-pool @solana/web3.js
 ```
 
-Compiled ESM JavaScript with type definitions: browsers (any bundler), Node 18+, Bun, Deno.
-Optional extras: `@etchydotfun/rune-pool/deposit` (needs `@scure/btc-signer`),
-`@etchydotfun/rune-pool/vault` (needs `@dfinity/agent`), `@etchydotfun/rune-pool/wallets` (browser
-wallets, no dependency). Build from source: `npm run build` (tsc, then a Node load test and a
-browser bundle test).
+The package is published under the program's name, `rune-pool`. It ships as ESM with type
+definitions and runs in browsers (any bundler), Node.js 18+, Bun and Deno.
 
-## Two ways in
+| Entry point | Contents | Peer dependency |
+| --- | --- | --- |
+| `@etchydotfun/rune-pool` | Client, quotes, trades, API client, indexer, keeper | `@solana/web3.js` |
+| `@etchydotfun/rune-pool/deposit` | Deposits built and signed in a Bitcoin wallet | `@scure/btc-signer` |
+| `@etchydotfun/rune-pool/vault` | Vault canister client, for keepers | `@dfinity/agent` |
+| `@etchydotfun/rune-pool/wallets` | Xverse, UniSat, Leather and OKX in the browser | none |
 
-| | Who signs | Who pays the Solana fee | Use |
-|---|---|---|---|
-| **SDK** (`createRunePoolClient`) | the user's Solana wallet | the user | Solana wallets, bots, terminals |
-| **API** (`createEtchyApi`) | the user's Bitcoin wallet (BIP-322 message) | Etchy's relay | Bitcoin wallets (Xverse, UniSat, Leather, ...) |
+## Quick start
 
-You can mix them. For example, use the SDK for reads and quotes on your own RPC, and the API
-only to relay Bitcoin-wallet orders.
+### Market data
 
-## Quick start (Solana wallet)
-
-```ts
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
-import { createRunePoolClient, formatUnits } from '@etchydotfun/rune-pool';
-
-const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
-const pools = createRunePoolClient({ connection });
-
-// 1. Find a pool: all of them, or by Rune id.
-const all = await pools.listPools();
-const pool = all.find((p) => p.name === 'ETCHY•FUN')!;
-
-// 2. Quote: the exact result the program will give right now.
-const q = await pools.quote(pool, 'buy', 20_000n /* sats */, 100 /* 1% slippage */);
-console.log(formatUnits(q.amountOut, pool.divisibility), 'Runes, fee', q.fee);
-
-// 3. Buy with the wallet's WBTC. The Runes go to its pool balance.
-const ixs = await pools.buy({
-  pool,
-  trader: wallet.publicKey,
-  btcIn: 20_000n,
-  minRuneOut: q.minOut,
-});
-await wallet.sendTransaction(new Transaction().add(...ixs), connection);
-
-// 4. Sell. The WBTC goes to the wallet's WBTC account (created if missing).
-const sell = await pools.sell({
-  pool: await pools.getPool(pool.address).then((p) => p!),
-  signer: wallet.publicKey,
-  runeIn: q.amountOut,
-  minBtcOut: 1n,
-});
-```
-
-Amounts are `bigint` in base units: sats for BTC and WBTC, and Rune units
-(`10 ** pool.divisibility` per whole Rune) for Runes.
-
-## Quick start (Bitcoin wallet, through the relay)
-
-The user signs a readable order with their Taproot (`bc1p...`) address. The relay checks it
-and sends it. The program checks the signature again. A changed order fails
-(`BAD_BTC_SIGNATURE`), and each order number works once (`BAD_NONCE`).
+No key or wallet is needed. The public API allows cross-origin requests, so browsers can call it
+from any site.
 
 ```ts
 import { createEtchyApi } from '@etchydotfun/rune-pool';
 
 const api = createEtchyApi('https://api.etchy.fun/rune-pools');
 
-// 1. Quote, then ask for the order text.
-const q = await api.quote(pool, 'buy', 10_000n, 100);
-const order = await api.order({
-  pool,
-  bitcoinAddress: 'bc1p...',
-  side: 'buy',
-  amount: 10_000n,
-  minOut: BigInt(q.minOut),
-});
-// order.text, for example:
-//   Etchy Rune Pools (mainnet): buy ETCHY•FUN (Rune 971505:1052) with 0.00010000 BTC of my
-//   Etchy balance, for at least 2942836.740124 ETCHY•FUN.
-//   Order 2, valid until 1792611734 (unix time).
-// Every text names the network ("(devnet)" on devnet): one signed for devnet never works
-// on mainnet.
+const pools = await api.pools({ sort: 'volume' });
+const pool = await api.pool('971505:1052'); // a Rune ID, a Rune name or a pool address
 
-// 2. The wallet signs it (BIP-322 "sign message", e.g. Xverse signMessage / UniSat
-//    signMessage(text, 'bip322-simple')).
+const { trades, next } = await api.tradesPage(pool.pool, { limit: 100 });
+const candles = await api.candles(pool.pool, '5m'); // market cap in BTC and USD
+const holders = await api.holders(pool.pool);
+const onBitcoin = await api.bitcoinHolders(pool.pool);
+
+const live = api.stream((t) => console.log(t.side, t.btcAmount), { pool: pool.pool });
+// live.close() when done
+```
+
+The same data can be read from the chain alone with `createPoolIndexer({ connection })`, with no
+Etchy server involved. See `examples/read-devnet.ts`.
+
+### Trading from a Solana wallet
+
+```ts
+import { Connection, Transaction } from '@solana/web3.js';
+import { createRunePoolClient, formatUnits } from '@etchydotfun/rune-pool';
+
+const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+const client = createRunePoolClient({ connection });
+
+const pool = (await client.listPools()).find((p) => p.name === 'ETCHY•FUN')!;
+
+// The exact result for 20,000 sats at the current price, with 1% slippage.
+const quote = await client.quote(pool, 'buy', 20_000n, 100);
+console.log(formatUnits(quote.amountOut, pool.divisibility), 'Runes');
+
+// `wallet` is any Solana wallet adapter. The Runes are credited to its balance in the pool.
+const buy = await client.buy({
+  pool,
+  trader: wallet.publicKey,
+  btcIn: 20_000n,
+  minRuneOut: quote.minOut,
+});
+await wallet.sendTransaction(new Transaction().add(...buy), connection);
+
+// Selling pays WBTC to the wallet's WBTC account, created if missing.
+const current = (await client.getPool(pool.address))!;
+const back = await client.quote(current, 'sell', quote.amountOut, 100);
+const sell = await client.sell({
+  pool: current,
+  signer: wallet.publicKey,
+  runeIn: quote.amountOut,
+  minBtcOut: back.minOut,
+});
+await wallet.sendTransaction(new Transaction().add(...sell), connection);
+```
+
+All amounts are `bigint` in base units: satoshis for BTC and WBTC, and Rune units
+(`10 ** pool.divisibility` per Rune) for Runes.
+
+### Trading from a Bitcoin wallet
+
+A Bitcoin wallet needs no SOL. It signs a readable order with its Taproot (`bc1p`) key, and
+Etchy's relay submits the order and pays the Solana fee. The program verifies the signature
+itself, so a modified order fails and each order number works once.
+
+```ts
+import { createEtchyApi } from '@etchydotfun/rune-pool';
+
+const api = createEtchyApi('https://api.etchy.fun/rune-pools');
+const { pool } = await api.pool('971505:1052');
+const bitcoinAddress = 'bc1p...';
+
+const quote = await api.quote(pool, 'buy', 10_000n, 100);
+const minOut = BigInt(quote.minOut);
+const order = await api.order({ pool, bitcoinAddress, side: 'buy', amount: 10_000n, minOut });
+
+// BIP-322: Xverse `signMessage`, UniSat `signMessage(text, 'bip322-simple')`, or the
+// helpers in `@etchydotfun/rune-pool/wallets`.
 const signature = await wallet.signMessage(order.text);
 
-// 3. The relay sends it (about 1-2 s).
 const { signature: tx } = await api.trade({
   pool,
-  bitcoinAddress: 'bc1p...',
+  bitcoinAddress,
   side: 'buy',
   amount: 10_000n,
-  minOut: BigInt(q.minOut),
+  minOut,
   nonce: order.nonce,
   expiry: order.expiry,
   signature,
 });
 ```
 
-A Bitcoin wallet's balances belong to its own program account (`pools.bitcoinWallet(address)`
-returns it). They work exactly like a Solana wallet's balances.
+The wallet is asked to sign text like this:
 
-## BTC in and out, through NEAR (Bitcoin wallets)
+```text
+Etchy Rune Pools (devnet): buy ETCHY•FUN (Rune 971505:1052) with 0.00010000 BTC of my Etchy
+balance, for at least 2942836.740124 ETCHY•FUN.
+Order 2, valid until 1792611734 (unix time).
+```
 
-A Bitcoin wallet's WBTC lives in a WBTC account owned by its program account. No key exists
-for that account: only the wallet's own signatures move the WBTC. A sale always pays WBTC
-into that account. Bitcoin moves only through NEAR Intents, never through an Etchy wallet.
+The signature covers these exact bytes, so always use the text returned by the relay or built by
+the SDK (`tradeMessage`, `approveMessage`). The wording can change between program versions.
 
-### Add BTC
+## Bitcoin wallets: moving BTC and Runes
 
-Every Bitcoin wallet has a SOL deposit address, `pda.btcSol(taprootKey(bc1p))`. Nobody holds
-its key.
+BTC enters and leaves through NEAR Intents, never through an Etchy wallet.
 
-1. **The browser asks NEAR's 1Click directly** (it allows any web page): call
-   `nearAddQuote({ sats, depositSol, refundTo })`.
-   - It is a BTC to SOL quote, with the wallet's SOL deposit address as the recipient.
-   - Refunds go to the user's own Bitcoin address.
-   - The quote is checked field by field.
-   - The wallet sends `amountIn` sats to `depositAddress`.
-   - Every quote has its own deposit address, so any number of users can deposit at once.
-   - NEAR: 8,300 sats minimum, about 5 BTC maximum per swap, about 13 minutes.
-2. **Anyone swaps the SOL into WBTC** in one transaction, built by `solSwapInstructions`:
-   `sol_swap_begin`, then any route (for example `jupiterRoute`) paying the wallet's swap
-   inbox, then `sol_swap_end`.
-   - The program refuses less than Pyth's BTC/USD and SOL/USD market value, less the
-     tolerance (1%).
-   - The sender keeps the fixed `swap_fee_lamports`, which pays its Solana fees and rent.
-   - Etchy runs a keeper that does this within seconds. Anyone else can do it too, with
-     `solSwapQuote` and `solSwapInstructions`.
+- **Adding BTC.** NEAR swaps the wallet's BTC to SOL and pays it to the wallet's own deposit
+  address on Solana, an address no one holds a key to. Anyone can then swap that SOL to WBTC in a
+  single transaction, which the program accepts only at Pyth's market price or better, less a 1%
+  tolerance. Etchy's keeper does this within seconds. See `nearAddQuote`, `solSwapQuote` and
+  `solSwapInstructions`.
+- **Withdrawing BTC.** The wallet signs an order naming a Bitcoin address. One Solana transaction
+  sells the WBTC for SOL and pays NEAR, which then sends BTC to that address; if the payment
+  falls short, the whole transaction fails. See `nearWithdrawQuote` and
+  `nearWithdrawInstructions`.
+- **Runes to Bitcoin.** `api.withdrawRunes` sends Runes to the wallet's own Taproot address with
+  one signature. The wallet approves a one-time key for exactly the amount, plus the Runes sold
+  to pay the withdrawal fee. The vault pays the Runes in its next batch.
+- **Runes into a pool.** `api.prepareDeposit` returns one PSBT for the wallet to sign: the Runes
+  and the memo, with the fee paid from the wallet's payment address. `api.sendDeposit` broadcasts
+  it, and `api.deposit` follows it until the Runes are credited. To build deposits without Etchy's
+  server, use `@etchydotfun/rune-pool/deposit`.
 
-`POST /v1/sol-swap/watch { bitcoinAddress }` tells Etchy's keeper to look now.
-`GET /v1/wallets/:bc1p/near` shows the deposit address, the SOL waiting and what it would
-swap for.
+## HTTP API
 
-SDK: `nearAddQuote`, `nearStatus`, `solDeposit`, `solSwapQuote`, `solSwapInstructions`,
-`jupiterRoute`, `parsePyth`, `minSwapOut`.
+Base URL: `https://api.etchy.fun/rune-pools` (devnet). Amounts are strings in base units. Errors
+are returned as `{ "error": "CODE" }` with an HTTP status; `RPC_BUSY` (503) means Solana's RPC
+was briefly unavailable, and the request can be retried. Each IP address may make 600 GET and 60
+POST requests per minute and hold 10 open streams.
 
-### Withdraw to Bitcoin
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/v1/pools?sort=new\|mcap\|volume\|change\|trades\|last` | Every pool: price, market cap in BTC and USD, reserves, fees, 24-hour stats |
+| GET | `/v1/pools/:pool` | One pool, by address, Rune ID or Rune name |
+| GET | `/v1/pools/:pool/stats` | Holders, 24-hour trades and volume, price change, all-time high |
+| GET | `/v1/pools/:pool/quote?side=buy\|sell&amount=N&slippageBps=100` | Output, minimum output, fee split and price impact |
+| GET | `/v1/pools/:pool/trades?limit=50&before=ID` | Trades, newest first, with a cursor for the next page |
+| GET | `/v1/pools/:pool/candles?interval=5m&limit=300` | Market cap candles in BTC and USD, from 1s to 1d |
+| GET | `/v1/pools/:pool/holders` | Balances in the pool, and Runes on their way to Bitcoin |
+| GET | `/v1/pools/:pool/bitcoin-holders` | Holders on Bitcoin, by address |
+| GET | `/v1/pools/:pool/rewards` | Fee reward rounds, for pools that pay fees to holders |
+| GET | `/v1/pools/:pool/logo` | The logo inscribed with the Rune |
+| GET | `/v1/stream?pool=` | Server-sent events: every trade as soon as it is confirmed |
+| GET | `/v1/wallets/:address/balances` | Balances of a Solana address or a Taproot address |
+| GET | `/v1/wallets/:address/withdrawals?pool=` | Withdrawal requests and the Bitcoin transactions that paid them |
+| POST | `/v1/relay/order`, `/v1/relay/trade` | A Bitcoin wallet's order: the text to sign, then the signed order |
+| GET, POST | `/v1/pools/:pool/sol-quote`, `/v1/sol/order`, `/v1/sol/send` | A trade paid in SOL from a Solana wallet |
+| POST | `/v1/relay/withdraw-runes-order`, `/v1/relay/withdraw-runes`, `/v1/relay/session-submit` | Runes to the wallet's own Taproot address |
+| POST | `/v1/deposits/prepare`, `/v1/deposits/send` | A deposit PSBT to sign, then its broadcast |
+| GET | `/v1/pools/:pool/deposits/:txid` | A deposit's confirmations and state |
+| GET | `/v1/wallets/:bc1p/near` | The wallet's deposit address for adding BTC through NEAR |
+| POST | `/v1/relay/near-withdraw-order`, `/v1/relay/near-withdraw` | BTC to any Bitcoin address through NEAR |
 
-1. **Quote.** `POST /v1/relay/near-withdraw-order { bitcoinAddress, amount, to }`. The relay
-   asks NEAR for a SOL to BTC quote paying `to` (refunds go back to the wallet's SOL deposit
-   address, where they turn into WBTC again). It returns NEAR's Solana deposit address, the
-   SOL that goes there (`minLamports`), the BTC NEAR expects to pay (`btcOut`), and the text.
-2. **Sign.** The wallet signs, for example: "Etchy Rune Pools (mainnet): withdraw
-   0.00100000 BTC of my Etchy balance to bc1q... through NEAR: sell it for at least
-   0.790000000 SOL sent to NEAR's deposit address 7xKX...."
-3. **Send.** `POST /v1/relay/near-withdraw { id, signature }`. One Solana transaction:
-   - `near_withdraw_begin` gives the WBTC to the sender (here Etchy's relay);
-   - the sender swaps it to SOL and pays `minLamports` to NEAR's deposit address;
-   - `near_withdraw_end` checks that the deposit address got it.
+`createEtchyApi` wraps every endpoint with typed methods.
 
-   Anything less and nothing happens. The program also refuses unless that SOL (plus the
-   sender's small fee) is worth the WBTC at Pyth's prices, less the tolerance (1%). NEAR then
-   pays the BTC (about 13 minutes); `nearStatus(deposit)` follows it.
+## SDK reference
 
-Anyone can send withdrawals, not only Etchy's relay: `nearWithdrawInstructions` builds the
-transaction (with `jupiterSellRoute` for the swap), `nearWithdrawCheck` gives the least SOL
-the program accepts.
+| Area | Functions |
+| --- | --- |
+| Reads (`createRunePoolClient`) | `getConfig`, `listPools`, `getPool`, `poolOfRune`, `getBalance`, `balancesOf`, `fees`, `getVault`, `bitcoinWallet` |
+| Quotes | `quote`, `quoteExactOut`, `quoteOnChain` |
+| Trades and balances | `buy`, `sell`, `transferRunes`, `approve`, `closeBalance` |
+| Bitcoin-wallet orders | `btcTradeOrder`, `btcTrade`, `btcApproveOrder`, `btcApprove`, `btcSendWbtcOrder`, `btcSendWbtc`, `bip322Signature` |
+| Withdrawals and deposits | `requestWithdrawal`, `withdrawalsOf`, `getWithdrawal`, `cancelWithdrawal`, `closeWithdrawal`, `depositInfo` |
+| History and live data | `tradesOf`, `recentTrades`, `createPoolIndexer`, `subscribeTrades`, `tradesFromLogs`, `poolStats` |
+| HTTP API (`createEtchyApi`) | `pools`, `pool`, `stats`, `tradesPage`, `candles`, `holders`, `bitcoinHolders`, `rewards`, `stream`, `quote`, `order`, `trade`, `withdrawRunes`, `withdrawals`, `depositCoins`, `prepareDeposit`, `sendDeposit`, `deposit`, `solQuote`, `solOrder`, `solSend` |
+| NEAR and swaps | `nearAddQuote`, `nearStatus`, `solSwapQuote`, `solSwapInstructions`, `nearWithdrawQuote`, `nearWithdrawInstructions`, `jupiterRoute`, `jupiterSellRoute` |
+| Keeper | `createKeeper`; `createVaultCanister` and `keeperVault` from `/vault` |
+| Low level | `instruction`, `pda`, `decodeAccount`, `decodeEvent`, `eventsFromLogs`, `errorName`, `IDL`, `PROGRAM_ID`, `tradeMessage`, `approveMessage`, `quoteBuy`, `quoteSell` |
 
-SDK: `nearWithdrawQuote`, `nearWithdrawMessage`, `nearWithdrawAllowed`, `nearWithdrawFloor`,
-`nearWithdrawInstructions`, `jupiterSellRoute`, `scriptAddress`, `addressScript`.
+Messages, memos and curve math match what the program checks, byte for byte. Trade and account
+builders return instructions for you to sign and send.
 
-## Runes out to a Bitcoin wallet, and back (Bitcoin wallets)
+## Running a keeper
 
-**Out, one signature.** The wallet approves a one-time key for exactly the Runes it takes out
-plus the few sold for the Bitcoin withdrawal fee (`withdrawFee(pool)`). The key signs the sale
-and the withdrawal to the wallet's **own** Taproot address, and the relay sends them and pays
-the Solana fee. The approval is used up exactly, so the key can do nothing after. The vault pays
-the Runes on Bitcoin in its next batch.
+A handful of permissionless jobs keep pools in step with Bitcoin: submitting block headers to the
+relay, asking the canister to open vaults and to start and pay withdrawal batches, proving
+payouts, and proving and crediting deposits. Etchy runs a keeper, but nothing depends on it.
+Every step is checked by the program or the canister, so a keeper cannot move funds.
 
 ```ts
-const { signature, order } = await api.withdrawRunes({
-  pool: pool.pool,
-  bitcoinAddress: 'bc1p...', // the wallet's Taproot (Runes) address
-  amount: 1_000_000n, // Rune units
-  signMessage: (text) => wallet.signMessage(text), // BIP-322, base64
+import { Connection } from '@solana/web3.js';
+import { createKeeper } from '@etchydotfun/rune-pool';
+import { createVaultCanister, keeperVault } from '@etchydotfun/rune-pool/vault';
+
+const keeper = createKeeper({
+  connection: new Connection('https://api.devnet.solana.com', 'confirmed'),
+  payer, // a funded Keypair: it pays Solana fees and temporary rent
+  vault: keeperVault(await createVaultCanister()),
 });
-const list = await api.withdrawals('bc1p...', pool.pool); // pending, in-batch, delivered + txid
+
+setInterval(() => keeper.tick().catch(console.error), 60_000);
 ```
 
-The one-time key comes from Web Crypto (browsers, Node 20+): `oneTimeSessionKey()`. Pass your
-own `session` (`{ publicKey, sign }`) to use another signer. The three steps on their own:
-`runesOutOrder`, `runesOut`, `sessionSubmit`.
+`examples/keeper-devnet.ts` is a complete, runnable version.
 
-**Back into the pool.** `depositCoins(bc1p)` lists the wallet's Rune outputs each pool knows.
-`prepareDeposit({ pool, ordinalsAddress, ordinalsPublicKey, paymentAddress, paymentPublicKey })`
-returns one PSBT (the Runes plus BTC for the fee, from a separate payment address) for the
-wallet's `signPsbt(psbtBase64, signInputs)`. Then `sendDeposit({ unsignedTxid, signedPsbt })`,
-and `deposit(pool, txid)` follows it until it is credited to the wallet's pool balance. Without
-Etchy's server: `@etchydotfun/rune-pool/deposit`.
+## Networks
 
-## Trade with SOL (Solana wallets)
+| | Devnet |
+| --- | --- |
+| `rune_pool` program | `D2gyR3iREHCwmTZNop4kz4ZfAjho5mY6h4QMbJqbEKyU` |
+| `btc_relay` program | `9enwiwQwfPH5FSjcSo1fDViJwM8kQn5LpsrEq3uKXrbY` |
+| HTTP API | `https://api.etchy.fun/rune-pools` |
 
-`solQuote(pool, side, amount, { wallet })`, then `solOrder({ pool, wallet, side, amount })`
-returns an unsigned transaction the wallet signs (it pays its own fee), then `solSend(signed)`.
-A buy spends `amount` lamports; a sale sells `amount` Rune units for SOL. Devnet now; mainnet
-answers `SOL_TRADES_SOON`.
-
-## API reference
-
-Base URL: `https://api.etchy.fun/rune-pools` (devnet test). All amounts are strings in base units. Errors are
-`{ "error": "CODE" }` with an HTTP status. Limits per IP: 600 reads (GET) and 60 relay calls
-(POST) a minute, 10 open streams. `RPC_BUSY` (503): Solana's RPC refused for a moment; ask
-again in a few seconds.
-
-| Method | Path | Returns |
-|---|---|---|
-| GET | `/v1/pools?sort=new\|mcap\|volume\|change\|trades\|last` | `{ pools: ApiPool[] }`: every pool, with price, market cap (BTC, USD), reserves, fees, vault address, `stats` |
-| GET | `/v1/pools/:pool` | `ApiPool` |
-| GET | `/v1/pools/:pool/stats` | holders, 24h trades, volume, change, ATH |
-| GET | `/v1/stream?pool=` | Server-Sent Events: `event: trade`, every trade the moment it is confirmed |
-| GET | `/v1/pools/:pool/quote?side=buy\|sell&amount=N&slippageBps=100` | `ApiQuote`: `amountOut`, `minOut`, `fee`, `impactBps` |
-| GET | `/v1/pools/:pool/trades?limit=50&before=id` | `{ trades: ApiTrade[], total, next, btcUsd }`, newest first |
-| GET | `/v1/pools/:pool/candles?interval=5s&limit=300` | market cap candles `btc` and `usd`, `now`, `btcUsd` |
-| GET | `/v1/pools/:pool/holders` | pool balances, `curve`, `toBitcoin`, `onBitcoin` |
-| GET | `/v1/pools/:pool/bitcoin-holders` | holders on Bitcoin, by address |
-| GET | `/v1/pools/:pool/rewards` | `ApiRewards`: the pool's fee rewards (owed, paid, waiting, next round); `fees: null` if none |
-| GET | `/v1/pools/:pool/logo` | the inscribed logo (`meta.logo`), as inscribed |
-| GET | `/v1/pools/:pool/withdraw-fee` | `{ feeSats, feeRunes }`: a withdrawal to Bitcoin's fee, and the Runes sold for it |
-| GET | `/v1/pools/:pool/deposits/:txid` | `ApiDeposit`: confirmations, `need`, `state` (credited once proven) |
-| GET | `/v1/pools/:pool/sol-quote?side&amount&wallet&slippageBps` | `ApiSolQuote`: a trade with SOL (devnet now) |
-| GET | `/v1/wallets/:address/balances` | a Solana address or a `bc1p...` address: its pool balances and WBTC |
-| GET | `/v1/wallets/:address/withdrawals?pool=` | `{ withdrawals: ApiWithdrawal[] }`: status, destination, the Bitcoin txid once paid |
-| GET | `/v1/wallets/:bc1p/deposit-coins` | the Rune outputs at that address each pool knows (only those can be deposited) |
-| POST | `/v1/deposits/prepare` | `{ pool, ordinalsAddress, ordinalsPublicKey, paymentAddress, paymentPublicKey }` → `ApiDepositPlan` (a PSBT to sign) |
-| POST | `/v1/deposits/send` | `{ unsignedTxid, signedPsbt }` → `{ txid }` (sent on Bitcoin) |
-| POST | `/v1/relay/withdraw-runes-order` | `{ pool, bitcoinAddress, amount, session }` → `ApiRunesOutOrder` (the approval text, valid 10 min) |
-| POST | `/v1/relay/withdraw-runes` | `{ id, signature }` → `{ id, message }` (for the session key) |
-| POST | `/v1/relay/session-submit` | `{ id, signature }` (the session key's Ed25519 signature, base64) → `{ signature }` |
-| POST | `/v1/sol/order` | `{ pool, wallet, side, amount, slippageBps }` → an unsigned transaction (base64) |
-| POST | `/v1/sol/send` | `{ transaction }` (wallet-signed) → `{ signature }` |
-| GET | `/v1/wallets/:bc1p/near` | the wallet's SOL deposit address (NEAR's recipient), SOL waiting, the swap minimum |
-| POST | `/v1/sol-swap/watch` | `{ bitcoinAddress }`: Etchy's keeper watches that deposit (it also finds them alone) |
-| POST | `/v1/relay/near-withdraw-order` | `{ bitcoinAddress, amount, to }` → `{ id, text, deposit, minLamports, btcOut, btcOutMin, nonce, expiry }` (valid 2 min) |
-| POST | `/v1/relay/near-withdraw` | `{ id, signature }` → `{ signature }` (Solana tx) |
-| POST | `/v1/relay/order` | `{ pool, bitcoinAddress, side, amount, minOut }` → `{ text, nonce, expiry }` (valid 2 min) |
-| POST | `/v1/relay/trade` | the same fields plus `nonce`, `expiry`, `signature` (BIP-322, base64) → `{ signature }` (Solana tx) |
-
-## SDK reference (`createRunePoolClient({ connection })`)
-
-Reads:
-
-- `getConfig()`: the fee modes, the WBTC mint, the pause flags, the network named in signed
-  texts, and the launch rules (`launchOnly`, `startMcap`).
-- `listPools()`, `getPool(address)`, `poolOfRune(block, tx)` (the pool address of a Rune id).
-- `getBalance(pool, owner)`, `balancesOf(owner)`: Rune balances inside pools.
-- `fees(pool)`: the pool's fee rates (buy and sell, total and creator part).
-- `getVault(pool)`: the Bitcoin vault (address, Runes held, withdrawals).
-- `bitcoinWallet(bc1pAddress)`: that wallet's program account, WBTC account and next order
-  number.
-
-Quotes:
-
-- `quote(pool, 'buy' | 'sell', amountIn, slippageBps)`: exact, computed locally with the
-  program's own math.
-- `quoteExactOut(pool, runeOut)`: sats needed to buy at least `runeOut`.
-- `quoteOnChain(pool, side, amount, payer)`: the program's own answer, simulated.
-
-Trades (each returns instructions; you sign and send):
-
-- `buy`, `sell`.
-- `transferRunes`: instant, inside the pool, to any owner.
-- `btcTrade`: submit a Bitcoin wallet's signed order yourself, if you run your own relay.
-
-Bitcoin wallets without Etchy's relay (the wallet signs the text, BIP-322; anyone may send
-it and pays its Solana fee; Etchy's fee is taken on every trade either way):
-
-- `btcTradeOrder({ pool, bitcoinAddress, isBuy, amount, minOut })` then `btcTrade`.
-- `btcApproveOrder({ pool, bitcoinAddress, delegate, amount })` then `btcApprove`: let a
-  session key sell, send or withdraw up to `amount` (0 revokes). A Bitcoin wallet withdraws
-  its Runes to Bitcoin this way: the session key calls `requestWithdrawal` with
-  `owner = bitcoinWallet(address).owner`.
-- `btcSendWbtcOrder({ bitcoinAddress, to, amount })` then `btcSendWbtc`: WBTC to a Solana
-  wallet.
-- `bip322Signature(walletAnswer)`: the 64-byte signature the program checks, from the
-  base64 answer of Xverse, UniSat or Leather.
-
-Balances and withdrawals:
-
-- `approve({ pool, owner, delegate, amount })` (Solana wallets; 0 revokes),
-  `closeBalance({ pool, owner })` (an empty balance; rent back).
-- `withdrawalsOf(owner, pool?)`, `getWithdrawal(pool, id)`: status (`pending`, `in-batch`,
-  `delivered`), destination address, the Bitcoin txid once paid.
-- `cancelWithdrawal({ pool, id, signer })`: while still `pending`; Runes and fee back.
-- `closeWithdrawal({ pool, id, closer })`: once delivered; rent back to whoever paid it.
-
-Launching a Rune is done on etchy.fun only.
-
-Bitcoin:
-
-- `requestWithdrawal({ pool, signer, amount, script })`: real Runes out to a Bitcoin address.
-  The vault pays them in its next batch.
-- `depositInfo(pool, owner)`: where to send Runes back to the vault, and the `OP_RETURN` memo
-  that credits them to `owner`. They are credited after 1–2 confirmations.
-- `@etchydotfun/rune-pool/deposit` (needs `@scure/btc-signer`): the whole deposit as ONE
-  transaction the wallet signs. `depositableCoins` (the wallet's Bitcoin outputs of the Rune
-  that the pool knows),
-  `depositTransaction` (a PSBT plus `signInputs` for `signPsbt`), `finishDeposit`,
-  `sendDeposit`, `depositStatus`, `depositOwnerOf(bc1p)`.
-
-The pool's record (`createPoolIndexer({ connection })`, from the chain only):
-
-- `sync(pool)`, then `trades(pool, { limit, before })`;
-- `candles(pool, interval)`: 1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 4h or 1d. Market cap
-  candles in BTC and USD (Pyth's BTC price);
-- `holders(pool)`: pool balances (Bitcoin wallets by their bc1p address), the curve, and
-  Runes on their way to Bitcoin;
-- `bitcoinHolders(pool)`: who holds the Rune on Bitcoin (withdrawn), from the pool's proven
-  records.
-
-The keeper (`createKeeper({ connection, payer, vault })`, vault from
-`@etchydotfun/rune-pool/vault`): anyone can run what keeps pools working (Bitcoin headers, vault
-batches, payout proofs, deposits). See `examples/keeper-devnet.ts`.
-
-History:
-
-- `tradesOf(signature)`: the trades in one transaction, decoded from the program's `Trade`
-  events.
-- `recentTrades(pool, limit, cache?)`: the pool's latest trades. Pass a `Map` as `cache` to read
-  each transaction only once.
-
-Lower level:
-
-- `instruction(name, args, accounts)`: any of the program's instructions, from the IDL.
-- `pda.*`, `decodeAccount`, `decodeEvent`, `eventsFromLogs`, `errorName`.
-- Math (`quoteBuy`, `quoteSell`, `priceE18`, ...) and messages (`tradeMessage`,
-  `approveMessage`, `formatSpacedRune`, ...). These are byte for byte what the program
-  checks.
-
-## Live data
-
-Every trade the moment it is confirmed, two ways:
-
-- From the chain, no Etchy server: `subscribeTrades(connection, onTrade, { pool? })` (a
-  WebSocket log subscription; returns the unsubscribe function). `tradesFromLogs` decodes any
-  transaction's logs the same way.
-- From Etchy's API: `createEtchyApi(url).stream(onTrade, { pool? })` (Server-Sent Events over
-  fetch, reconnects by itself; `close()`). Browsers can also use
-  `new EventSource(url + '/v1/stream?pool=...')`, `event: trade`.
-
-A trade can come twice around a reconnect: key on `id` (`signature:index`).
-
-## Rune lists
-
-- `api.pools({ sort })`: `new`, `mcap`, `volume`, `change`, `trades` or `last`. Every pool has
-  `stats`: holders, 24h trades (buys, sells, traders), 24h volume (sats and USD), 24h change,
-  all-time-high market cap, last trade time.
-- `api.stats(pool)`, or from the chain: `poolStats(trades, now, btcUsd)` and
-  `createPoolIndexer(...).stats(pool)` / `.holderCount(pool)`.
-
-## Wallets (browser)
-
-```ts
-import { installedWallets, signOrder } from '@etchydotfun/rune-pool/wallets';
-
-const [provider] = installedWallets(); // Xverse, UniSat, Leather, OKX: those in the browser
-const wallet = await provider.connect();
-// wallet.ordinals: the Taproot address (Runes and the pool balance); wallet.payment: BTC for fees
-const order = await sdk.btcTradeOrder({ pool, bitcoinAddress: wallet.ordinals.address, isBuy: true, amount: 10_000n, minOut });
-const { signature, raw } = await signOrder(wallet, order.text); // `signature` for Etchy's relay, `raw` for btcTrade
-const signedPsbt = await wallet.signPsbt(deposit.psbtBase64, deposit.signInputs); // a deposit
-```
-
-Single-address wallets (UniSat, OKX) must be on a Taproot (bc1p) address. Refusals throw a
-`WalletError` with the wallet's own words.
+Mainnet addresses will be published here at launch.
 
 ## Examples
 
-- `examples/read-api.ts [Rune ID] [wallet]`: no key. Everything from Etchy's API: pools,
-  trade history pages, candles, holders, 24h stats, fee rewards, a wallet's balances and
-  withdrawals, live trades.
-- `examples/read-devnet.ts`: no key, no Etchy server. Pools, an exact quote, the latest
-  trades, market cap candles in BTC and USD, holders on Solana and on Bitcoin, then live
-  trades.
-- `examples/keeper-devnet.ts <devnet key.json>`: run your own keeper.
+| File | What it shows |
+| --- | --- |
+| `examples/read-api.ts [runeId] [wallet]` | Market data from the HTTP API: pools, trades, candles, holders, rewards, a wallet's balances, live trades |
+| `examples/read-devnet.ts` | The same from the chain alone: quotes, trades, candles, holders on Solana and on Bitcoin |
+| `examples/keeper-devnet.ts <key.json>` | A keeper on devnet |
 
 ```bash
 npm install
-node --experimental-strip-types examples/read-devnet.ts
+node --experimental-strip-types examples/read-devnet.ts   # Node.js 22.6 or later
 ```
 
-## Links
+To build the package from source, run `npm run build`. It compiles to `dist/` and then checks
+that the output loads in Node.js and bundles for the browser.
 
-- Etchy: https://etchy.fun
-- Source: https://github.com/EtchydotFun/rune-pool
-- Security: security@etchy.fun (see `SECURITY.md`)
+## License
+
+[Apache License 2.0](LICENSE)

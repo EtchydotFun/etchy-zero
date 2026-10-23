@@ -1,11 +1,17 @@
-# Security
+# Security policy
 
-Please report security problems privately to **security@etchy.fun**. Do not open a public
-issue for them.
+## Reporting a vulnerability
 
-Include what you found, how to reproduce it, and what it could let someone do. We answer
-within 48 hours.
+Please report vulnerabilities privately to **security@etchy.fun**. Do not open a public issue.
 
-This package builds transactions and reads chain data. It never holds keys: every
-transaction is signed by the user's own wallet, and the rune-pool program checks every
-signature, proof and amount on chain.
+Include a description of the problem, steps to reproduce it, and the impact as you understand it.
+We acknowledge every report within 48 hours and keep you updated until it is resolved.
+
+## Scope
+
+This repository contains the TypeScript SDK. The SDK holds no keys: it reads chain data and builds
+transactions that the user's own wallet signs. The Etchy Zero programs verify every signature,
+Bitcoin proof and amount on chain, so a modified client cannot bypass those checks.
+
+Reports about the programs, the vault canister or Etchy's public API are welcome at the same
+address.

@@ -1,7 +1,7 @@
 {
   "name": "@etchydotfun/rune-pool",
   "version": "0.2.0",
-  "description": "Etchy Rune Pools: trade real Bitcoin Runes at Solana speed from any site, wallet or bot. Pools, quotes, trades, Bitcoin-wallet orders, deposits, charts, holders, the keeper.",
+  "description": "TypeScript SDK for Etchy Zero, the AMM for real Bitcoin Runes on Solana: market data, quotes, trades from Solana and Bitcoin wallets, deposits, withdrawals and the keeper.",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -67,12 +67,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EtchydotFun/rune-pool.git"
+    "url": "git+https://github.com/EtchydotFun/etchy-zero.git"
   },
-  "homepage": "https://github.com/EtchydotFun/rune-pool#readme",
+  "homepage": "https://github.com/EtchydotFun/etchy-zero#readme",
   "bugs": {
-    "url": "https://github.com/EtchydotFun/rune-pool/issues"
+    "url": "https://github.com/EtchydotFun/etchy-zero/issues"
   },
-  "keywords": ["bitcoin", "runes", "solana", "amm", "etchy", "wbtc"],
+  "keywords": ["bitcoin", "runes", "solana", "amm", "bonding-curve", "etchy", "etchy-zero", "wbtc"],
   "license": "Apache-2.0"
 }
