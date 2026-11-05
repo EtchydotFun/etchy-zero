@@ -436,6 +436,14 @@ export function routeProgramsOk(ixs: TransactionInstruction[]): boolean {
   return ixs.every((ix) => ok.has(ix.programId.toBase58()));
 }
 
+/**
+ * M114 (2026-10-26): `&excludeDexes=...` for a quote (none: nothing). Jupiter
+ * routes through Manifest missed their own minimum on 11 of 26 simulated
+ * SOL <-> WBTC trades (at 0.5%, 1% and 5% alike).
+ */
+const excluded = (dexes?: readonly string[]) =>
+  dexes?.length ? `&excludeDexes=${encodeURIComponent(dexes.join(','))}` : '';
+
 /** A Jupiter price only (no instructions): SOL -> WBTC (`buy`) or WBTC -> SOL. */
 export async function jupiterQuote(
   p: {
@@ -444,6 +452,8 @@ export async function jupiterQuote(
     wbtcMint: PublicKey;
     slippageBps?: number;
     maxAccounts?: number;
+    /** M114: DEX labels the route must not use. */
+    excludeDexes?: readonly string[];
     baseUrl?: string;
     apiKey?: string;
   },
@@ -453,7 +463,7 @@ export async function jupiterQuote(
     ? [WSOL, p.wbtcMint.toBase58()]
     : [p.wbtcMint.toBase58(), WSOL];
   const r = await f(
-    `${p.baseUrl ?? JUPITER_URL}/quote?inputMint=${a}&outputMint=${b}&amount=${p.amount}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    `${p.baseUrl ?? JUPITER_URL}/quote?inputMint=${a}&outputMint=${b}&amount=${p.amount}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}${excluded(p.excludeDexes)}`,
     { headers: jupHeaders(p.apiKey) },
   );
   if (!r.ok) throw new Error(`Jupiter quote: ${r.status}`);
@@ -506,6 +516,8 @@ export async function jupiterRoute(
     minOut: bigint;
     slippageBps?: number;
     maxAccounts?: number;
+    /** M114: DEX labels the route must not use. */
+    excludeDexes?: readonly string[];
     baseUrl?: string;
     apiKey?: string;
   },
@@ -513,7 +525,7 @@ export async function jupiterRoute(
 ) {
   const base = p.baseUrl ?? JUPITER_URL;
   const qr = await f(
-    `${base}/quote?inputMint=${WSOL}&outputMint=${p.wbtcMint.toBase58()}&amount=${p.lamports}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    `${base}/quote?inputMint=${WSOL}&outputMint=${p.wbtcMint.toBase58()}&amount=${p.lamports}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}${excluded(p.excludeDexes)}`,
     { headers: jupHeaders(p.apiKey) },
   );
   if (!qr.ok) throw new Error(`Jupiter quote: ${qr.status}`);
@@ -590,6 +602,8 @@ export async function jupiterSellRoute(
     minLamports: bigint;
     slippageBps?: number;
     maxAccounts?: number;
+    /** M114: DEX labels the route must not use. */
+    excludeDexes?: readonly string[];
     baseUrl?: string;
     apiKey?: string;
   },
@@ -597,7 +611,7 @@ export async function jupiterSellRoute(
 ) {
   const base = p.baseUrl ?? JUPITER_URL;
   const qr = await f(
-    `${base}/quote?inputMint=${p.wbtcMint.toBase58()}&outputMint=${WSOL}&amount=${p.sats}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}`,
+    `${base}/quote?inputMint=${p.wbtcMint.toBase58()}&outputMint=${WSOL}&amount=${p.sats}&slippageBps=${p.slippageBps ?? 50}&maxAccounts=${p.maxAccounts ?? JUPITER_MAX_ACCOUNTS}${excluded(p.excludeDexes)}`,
     { headers: jupHeaders(p.apiKey) },
   );
   if (!qr.ok) throw new Error(`Jupiter quote: ${qr.status}`);

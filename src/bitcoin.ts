@@ -346,6 +346,24 @@ export function esplora(
       };
     },
     prove,
+    /** M129: the coins spent by the newest transactions paying to `script` (by its script hash: any network). */
+    async scriptSpends(script: Uint8Array) {
+      const hash = hex(reversed(await sha256(script)));
+      const txs = (await get(`/scripthash/${hash}/txs`)) as
+        { vin?: { txid: string; vout: number }[] }[] | null;
+      return (txs ?? []).flatMap((t) =>
+        (t.vin ?? []).map((i) => ({ txid: i.txid, vout: i.vout })),
+      );
+    },
+    /** M129: a transaction without its witness, checked against its txid. */
+    async rawTx(txid: string) {
+      const hexTx = (await get(`/tx/${txid}/hex`, true)) as string | null;
+      if (!hexTx) throw new Error(`no transaction ${txid}`);
+      const t = stripWitness(fromHex(hexTx.trim()));
+      if (!eqBytes(await sha256d(t), internalTxid(txid)))
+        throw new Error('txid mismatch');
+      return t;
+    },
     async feeRate() {
       const r = (await get('/v1/fees/recommended')) as {
         halfHourFee?: number;

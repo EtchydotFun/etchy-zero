@@ -29,6 +29,8 @@ export * from './keeper.ts';
 export * from './keeper-chain.ts';
 export * from './math.ts';
 export * from './messages.ts';
+export * from './miner.ts';
+export * from './shelf.ts';
 export * from './solswap.ts';
 export {
   decipherRunestone,

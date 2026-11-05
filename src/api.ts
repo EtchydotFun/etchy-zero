@@ -52,6 +52,24 @@ export interface ApiPool {
   createdAt: number;
   /** Numbers for Rune lists (null while the pool's trades are being read). */
   stats: ApiPoolStats | null;
+  /** A Mined Rune's mine in brief (null: not a Mined Rune); `mine(pool)` has the rest. */
+  mined?: ApiPoolMined | null;
+}
+export interface ApiPoolMined {
+  mine: string;
+  start: number;
+  roundSecs: number;
+  /** Rune units: the whole mine, and mined so far; `speed` per round now. */
+  cap: string;
+  mined: string;
+  speed: string;
+  results: string;
+  /** About how many miners are mining now. */
+  minersNow: number;
+  /** Rune units bought back with the mining fees, locked for good. */
+  locked: string;
+  mcapAvg: string;
+  steps: { mcap: string; runesPerRound: string }[];
 }
 /** A Rune's inscribed launch details (see `runeInscription`); null fields: not inscribed. */
 export interface ApiPoolMeta {
@@ -294,6 +312,453 @@ export interface ApiOrder {
   text: string;
   nonce: string;
   expiry: string;
+}
+
+// ---------------------------------------------------------------- Ordinals collections
+/** One file of a Rune's Ordinals collection (its hash is in the inscribed fingerprint). */
+export interface ApiCollectionFile {
+  index: number;
+  contentType: string;
+  bytes: number;
+  sha256: string;
+  hash: string;
+}
+/**
+ * A pool's Ordinals collection. Each Ordinal is minted by burning `unit`
+ * Rune units; a Bitcoin block picks which one. `chain.states`: one digit
+ * per Ordinal (0 not minted, 3 minting, 2 minted, 4 in the pool, 5 leaving
+ * the pool, 6 on its way to the pool, 7 gone).
+ */
+export interface ApiCollection {
+  id: string;
+  size: number;
+  /** The fingerprint (Merkle root of every file), inscribed with the Rune's logo. */
+  root: string | null;
+  pool: string | null;
+  pictures: ApiCollectionFile[];
+  chain: {
+    size: number;
+    unit: string;
+    free: number;
+    drawing: number;
+    sending: number;
+    out: number;
+    drawDelay: number;
+    drawConfirmations: number;
+    states: string;
+  } | null;
+}
+/** An Ordinal in the pool, on its way to it, or leaving it. */
+export interface ApiShelfItem {
+  /** Its place in the collection (from 0: Ordinal #item+1). */
+  item: number;
+  state: 'selling' | 'shelf' | 'leaving' | 'stuck' | 'lost' | 'held';
+  /** On its way to the pool: the lowest price its seller takes (sats). */
+  minSats: string;
+  /** Its seller (on its way to the pool) or buyer (leaving): a Solana address. */
+  party: string | null;
+  /** Leaving: the Bitcoin address it goes to. */
+  to: string | null;
+  /** Where it is on Bitcoin. */
+  txid: string;
+  vout: number;
+}
+/**
+ * The pool's own market for its Ordinals: it buys any minted Ordinal of
+ * the collection at its Runes' value at the market price, less `feeBps`,
+ * and sells the ones it holds (`state: 'shelf'`) at their Runes' price.
+ */
+export interface ApiShelf {
+  pool: string;
+  /** The pool buys and sells Ordinals now. */
+  open: boolean;
+  /** The pool's Bitcoin address for its Ordinals. */
+  address: string | null;
+  feeBps: number;
+  /** Rune units in one Ordinal. */
+  unit: string;
+  /** The Bitcoin output an Ordinal travels on to and from the pool (sats). */
+  coinSats: string;
+  /** What the pool pays for one now, its fee taken (null: it cannot now). */
+  sellSats: string | null;
+  /** What one from the pool costs now, the buy fee included (null: none to sell). */
+  buySats: string | null;
+  runeValueSats: string | null;
+  /** Bitcoin confirmations before the pool pays a seller. */
+  need: number;
+  onShelf: number;
+  selling: number;
+  leaving: number;
+  lost: number;
+  items: ApiShelfItem[];
+  usdPerBtc: number | null;
+}
+/** One of a Bitcoin wallet's sales to the pool. */
+export interface ApiShelfSale {
+  item: number;
+  txid: string;
+  at: number;
+  stage:
+    | 'unseen'
+    | 'confirming'
+    | 'proving'
+    | 'arrived'
+    | 'waiting'
+    | 'paid'
+    | 'returning'
+    | 'returned';
+  confirmations: number;
+  need: number;
+  minSats: string;
+  quoteSats: string;
+  paidSats: string | null;
+  /** Waiting below its lowest price: what the pool pays now. */
+  nowSats: string | null;
+}
+/** A moment of an Ordinal's life, as the program recorded it. */
+export interface ApiOrdinalEvent {
+  kind:
+    | 'minted'
+    | 'inscribed'
+    | 'moved'
+    | 'to-shelf'
+    | 'sent-back'
+    | 'stuck'
+    | 'sold-to-pool'
+    | 'bought-from-pool'
+    | 'taken-back'
+    | 'lost';
+  /** Unix seconds (null: not known yet). */
+  at: number | null;
+  /** The Solana transaction that recorded it. */
+  signature: string;
+  /** Its Bitcoin transaction, where there is one. */
+  txid: string | null;
+  to: string | null;
+  sats: string | null;
+  who: string | null;
+}
+/** A sale to the pool, ready for the wallet to sign (one Bitcoin transaction). */
+export interface ApiShelfSellPlan {
+  pool: string;
+  item: number;
+  unsignedTxid: string;
+  psbtBase64: string;
+  /** Which inputs each address signs. */
+  signInputs: { address: string; indexes: number[] }[];
+  shelfAddress: string;
+  /** What the pool pays now, and how it is made (gross - kept). */
+  quoteSats: string;
+  grossSats: string;
+  keptSats: string;
+  /** The lowest the seller takes; below it the Ordinal waits as the seller's. */
+  minSats: string;
+  feeBps: number;
+  coinSats: string;
+  /** From the payment address: the output's top-up plus the network fee. */
+  topUpSats: string;
+  minerFeeSats: string;
+  feeRate: number;
+  need: number;
+}
+/** What a wallet does at the pool's market for Ordinals (`rune_pool::SHELF_*`). */
+export const SHELF_ACTIONS = { sell: 0, return: 1, buy: 2 } as const;
+export type ApiShelfAction = keyof typeof SHELF_ACTIONS;
+
+/**
+ * A transaction built for a Solana wallet (base64, the wallet pays its
+ * fee): it signs it, then `solSend` sends it, once, within `validSeconds`.
+ */
+export interface ApiWalletTx {
+  transaction: string;
+  validSeconds: number;
+}
+
+// ---------------------------------------------------------------- minting Ordinals
+/** What minting `count` Ordinals costs now (Rune units, sats, lamports). */
+export interface ApiOrdCost {
+  count: number;
+  /** Rune units burned (one share of the supply per Ordinal). */
+  burn: string;
+  /** Rune units sold to pay `feeSats` (1% margin for price moves). */
+  feeRunes: string;
+  /** `burn + feeRunes`: what the balance needs. */
+  needRunes: string;
+  /** The inscription fee and the Bitcoin payout fee, in sats. */
+  feeSats: string;
+  pictureFee: string;
+  withdrawalFee: string;
+  /** Ordinals not minted yet. */
+  free: number;
+  /** A Solana wallet's rent (back when its records close). */
+  rentLamports: string;
+  /** Each Ordinal's record (it stays with the Ordinal while the program follows it). */
+  recordRentLamports: string;
+  /** The same in sats, in a Bitcoin wallet's fee (the relay pays the SOL). */
+  recordRentSats: string;
+}
+/** Where a mint is: a Bitcoin block picks the Ordinals, then the vault inscribes them. */
+export type ApiOrdStage =
+  | 'waiting-block'
+  | 'drawing'
+  | 'drawn'
+  | 'inscribing'
+  | 'delivered'
+  | 'cancelled';
+export interface ApiOrdTake {
+  pool: string;
+  id: string;
+  count: number;
+  /** The Bitcoin block that picks them, and when they can be picked (unix seconds). */
+  target: number;
+  drawableAt: number;
+  /** The Taproot address they go to. */
+  to: string | null;
+  /** The Ordinals picked (places in the collection, from 0). */
+  items: number[];
+  stage: ApiOrdStage;
+  /** It can still be cancelled (the Runes and the fee back). */
+  cancellable: boolean;
+  reveal: { txid: string; confirmed: boolean } | null;
+  inscriptions: { item: number; inscription: string }[];
+}
+
+// ---------------------------------------------------------------- Ordinals listed by holders
+export type ApiOrdListingStatus =
+  'active' | 'pending' | 'sold' | 'cancelled' | 'gone';
+/** An Ordinal listed by its holder at its own price (a signed PSBT). */
+export interface ApiOrdListing {
+  id: number;
+  item: number;
+  inscription: string;
+  seller: string;
+  txid: string;
+  vout: number;
+  sats: string;
+  priceSats: string;
+  status: ApiOrdListingStatus;
+  createdAt: number;
+}
+/** A pool's market of Ordinals listed by their holders (cheapest first). */
+export interface ApiOrdMarket {
+  pool: string;
+  open: boolean;
+  feeBps: number;
+  minFeeSats: string;
+  minPriceSats: string;
+  maxPerPurchase: number;
+  /** One Ordinal's Runes at the market price now (null: not known). */
+  runeValueSats: string | null;
+  floorSats: string | null;
+  forSale: number;
+  minted: number;
+  listings: ApiOrdListing[];
+  stats: {
+    sales24h: number;
+    volume24hSats: string;
+    salesAll: number;
+    volumeAllSats: string;
+  };
+  sales: {
+    item: number;
+    inscription: string;
+    priceSats: string;
+    buyer: string;
+    seller: string;
+    txid: string;
+    at: number;
+  }[];
+  usdPerBtc: number | null;
+  feeRate: number | null;
+}
+/** A wallet's Ordinals of a pool's collection, its listings and its plain BTC. */
+export interface ApiOrdMarketWallet {
+  address: string;
+  payment: string;
+  ordinals: {
+    item: number;
+    inscription: string;
+    txid: string;
+    vout: number;
+    sats: string;
+    listable: boolean;
+    /** Why it cannot be listed (null: it can). */
+    why: string | null;
+    listing: ApiOrdListing | null;
+  }[];
+  listings: ApiOrdListing[];
+  spendableSats: string | null;
+  spendableCoins: number | null;
+}
+/** What a listing's seller signs (SIGHASH_SINGLE | ANYONECANPAY on input 0). */
+export interface ApiOrdListPlan {
+  psbtBase64: string;
+  signInputs: { address: string; indexes: number[]; sighash: number }[];
+  item: number;
+  inscription: string;
+  priceSats: string;
+  payTo: string;
+}
+/**
+ * A purchase to sign, or first a split of the buyer's BTC into the two
+ * outputs a purchase needs (`kind: 'split'`: sign it, `ordBuySplit`, then
+ * sign the purchase it returns).
+ */
+export type ApiOrdBuyPlan =
+  | {
+      kind: 'buy';
+      quoteId: string;
+      psbtBase64: string;
+      signInputs: { address: string; indexes: number[] }[];
+      priceSats: string;
+      etchyFeeSats: string;
+      minerFeeSats: string;
+      spentSats: string;
+      feeRate: number;
+      vsize: number;
+      expiresAt: string;
+    }
+  | {
+      kind: 'split';
+      quoteId: string;
+      psbtBase64: string;
+      signInputs: { address: string; indexes: number[] }[];
+      splitFeeSats: string;
+      priceSats: string;
+      etchyFeeSats: string;
+      minerFeeSats: string;
+      feeRate: number;
+      expiresAt: string;
+    };
+/** The text a seller signs (BIP-322) to take its listing off the market. */
+export function ordCancelMessage(p: {
+  id: number;
+  address: string;
+  signedAt: string;
+}): string {
+  return [
+    'Etchy: cancel my Ordinal listing',
+    String(p.id),
+    p.address,
+    p.signedAt,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------- BTC in from a Bitcoin wallet
+/** Adding BTC to a Bitcoin wallet's balance through NEAR: the payment to sign. */
+export interface ApiBtcInPlan {
+  unsignedTxid: string;
+  psbtBase64: string;
+  signInputs: Record<string, number[]>;
+  sats: string;
+  networkFeeSats: string;
+  feeRate: number;
+  /** NEAR's deposit address (the payment goes there). */
+  depositAddress: string;
+  /** SOL NEAR pays to the wallet's own deposit address, and at least. */
+  lamports: string;
+  minLamports: string;
+  swapFeeLamports: string;
+  /** WBTC it should bring at Pyth's price now, and at least (null: unknown). */
+  expectSats: string | null;
+  minSats: string | null;
+  timeEstimateSecs: number | null;
+}
+export interface ApiBtcIn {
+  depositAddress: string;
+  txid: string;
+  sats: string;
+  at: number;
+  /** NEAR's status (`SUCCESS` once paid out). */
+  near: string;
+  /** SOL waiting at the wallet's deposit address to be swapped (null: unknown). */
+  solWaiting: string | null;
+}
+
+// ---------------------------------------------------------------- Mined Runes
+export interface ApiMineRound {
+  round: string;
+  startsAt: number;
+  open: boolean;
+  results: number;
+  /** Every result's weight added up; the round's Runes are shared by weight. */
+  weight: string;
+  budget: string;
+  minDifficulty: number;
+}
+/** A Mined Rune's mine: the round now, the one before, and how fast it mines. */
+export interface ApiMine {
+  pool: string;
+  mine: string;
+  now: number;
+  start: number;
+  roundSecs: number;
+  round: ApiMineRound | null;
+  previous: ApiMineRound | null;
+  /** The fee of one result (lamports), and its whole cost to the key now. */
+  feeLamports: string;
+  resultLamports: string;
+  solUsd: number | null;
+  /** Rune units: the whole mine, mined so far, left. */
+  cap: string;
+  mined: string;
+  left: string;
+  roundsLeft: string;
+  results: string;
+  resultsPerRound: number;
+  divisibility: number;
+  /** Market cap now and its average (sats); the speed follows the average. */
+  mcap: string;
+  mcapAvg: string;
+  startMcap: string;
+  /** Rune units per round now. */
+  speed: string;
+  steps: { mcap: string; runesPerRound: string }[];
+  minDifficulty: number;
+  difficultyFloor: number;
+  targetResults: string;
+  /** Where the mining fees' buybacks are locked. */
+  locked: string;
+}
+/** One mining key's miner in a mine (`miner: null`: not opened yet). */
+export interface ApiMiner {
+  authority: string;
+  lamports: string | null;
+  /** What the key keeps (Solana's rent minimum), and what opening a miner takes. */
+  keyFloor: string;
+  openLamports: string;
+  miner: {
+    address: string;
+    /** Who gets its Runes (a Solana wallet, or a Bitcoin wallet's owner). */
+    owner: string;
+    /** Hex: the next result hashes this (it changes after every result). */
+    challenge: string;
+    pendingRound: string | null;
+    pendingShare: string | null;
+    pendingFinal: boolean;
+    unclaimed: string;
+    earned: string;
+    results: string;
+    best: number;
+    target: number;
+    lastRound: string | null;
+    /** Leading zero bits the next result needs now. */
+    need: number;
+  } | null;
+}
+/** What the mining key signs (`minePrepare`). */
+export type ApiMineStep =
+  | { kind: 'open'; pool: string; owner: string; target?: number }
+  | { kind: 'mine'; pool: string; nonce: bigint | string }
+  | { kind: 'claim'; pool: string }
+  | { kind: 'withdraw'; to: string; pools?: string[] };
+/** A message for the mining key to sign (base64), valid `validSeconds`. */
+export interface ApiMineMessage {
+  id: string;
+  message: string;
+  validSeconds: number;
+  /** Withdraw: the lamports sent. */
+  lamports?: string;
 }
 
 export class EtchyApiError extends Error {
@@ -553,8 +1018,7 @@ export function createEtchyApi(baseUrl: string, f: typeof fetch = fetch) {
       call<ApiDeposit>(`/v1/pools/${pool}/deposits/${txid}`),
     /**
      * Trade with SOL from a Solana wallet: a buy spends `amount` lamports, a
-     * sale sells `amount` Rune units for SOL. Devnet now (mainnet:
-     * `SOL_TRADES_SOON`).
+     * sale sells `amount` Rune units for SOL.
      */
     solQuote: (
       pool: string,
@@ -706,6 +1170,356 @@ export function createEtchyApi(baseUrl: string, f: typeof fetch = fetch) {
     /** Step 2: the wallet's signature of that text; Etchy's relay sends it. */
     nearWithdraw: (o: { id: string; signature: string }) =>
       call<{ signature: string }>('/v1/relay/near-withdraw', o),
+
+    // ---- Ordinals collections and the pool's market for them
+    /** A pool's Ordinals collection, and what each Ordinal is doing on chain. */
+    collection: (pool: string) =>
+      call<ApiCollection>(`/v1/pools/${pool}/collection`),
+    /** The URL of an Ordinal's art file (anyone can check it against the fingerprint). */
+    collectionFileUrl: (collectionId: string, item: number) =>
+      `${base}/v1/collections/${collectionId}/pictures/${item}`,
+    /** The pool's market for its Ordinals: both prices, and the Ordinals at or near it. */
+    shelf: (pool: string) => call<ApiShelf>(`/v1/pools/${pool}/shelf`),
+    /** A Bitcoin wallet's sales to the pool and its purchases on their way. */
+    shelfWallet: (pool: string, bitcoinAddress: string) =>
+      call<{
+        pool: string;
+        address: string;
+        owner: string;
+        sales: ApiShelfSale[];
+        buying: { item: number; txid: string; vout: number }[];
+      }>(
+        `/v1/pools/${pool}/shelf/wallet?address=${encodeURIComponent(bitcoinAddress)}`,
+      ),
+    /** An Ordinal's life on record, newest first. */
+    ordinalHistory: (pool: string, item: number) =>
+      call<{ pool: string; item: number; events: ApiOrdinalEvent[] }>(
+        `/v1/pools/${pool}/ordinals/${item}/history`,
+      ),
+    /**
+     * Selling an Ordinal to the pool, step 1: the one Bitcoin transaction
+     * the wallet signs (the Ordinal from its Taproot address, the network
+     * fee from its payment address). `minSats`: the lowest price it takes
+     * (default 97% of the price now).
+     */
+    sellToPoolPrepare: (o: {
+      pool: string;
+      item: number;
+      ordinalsAddress: string;
+      ordinalsPublicKey: string;
+      paymentAddress: string;
+      paymentPublicKey: string;
+      minSats?: bigint;
+    }) => call<ApiShelfSellPlan>('/v1/shelf/sell-prepare', o),
+    /** Step 2: the signed PSBT (within 10 minutes): sent on Bitcoin. The pool pays after `need` confirmations. */
+    sellToPoolSend: (o: { unsignedTxid: string; signedPsbt: string }) =>
+      call<{ pool: string; item: number; txid: string }>(
+        '/v1/shelf/sell-send',
+        o,
+      ),
+    /**
+     * A Bitcoin wallet at the pool's market, with ONE signed message (free:
+     * Etchy's relay pays the Solana fee): `buy` one the pool holds for at
+     * most `amount` sats of its Etchy balance (to its own Taproot address),
+     * take the price now for one on its way below its lowest price (`sell`,
+     * at least `amount`), or get it back unsold (`return`).
+     */
+    async shelfAction(o: {
+      pool: string;
+      bitcoinAddress: string;
+      item: number;
+      action: ApiShelfAction;
+      amount: bigint;
+      signMessage: (text: string) => Promise<string>;
+    }) {
+      const order = {
+        pool: o.pool,
+        bitcoinAddress: o.bitcoinAddress,
+        item: o.item,
+        action: SHELF_ACTIONS[o.action],
+        amount: o.amount,
+      };
+      const words = await call<ApiOrder>('/v1/relay/shelf-order', order);
+      const signature = await o.signMessage(words.text);
+      return call<{ signature: string }>('/v1/relay/shelf', {
+        ...order,
+        nonce: words.nonce,
+        expiry: words.expiry,
+        signature,
+      });
+    },
+    /**
+     * A Solana wallet buys one the pool holds, with SOL (mainnet): the
+     * unsigned transaction (SOL swapped to WBTC, then the buy, at most the
+     * price + 1%), sent to `address` (Taproot). Sign it, then `solSend`.
+     */
+    solShelfBuy: (o: {
+      pool: string;
+      wallet: string;
+      address: string;
+      item: number;
+    }) =>
+      call<{
+        transaction: string;
+        pool: string;
+        item: number;
+        to: string;
+        priceSats: string;
+        maxSats: string;
+        lamports: string;
+      }>('/v1/sol/shelf-buy', o),
+
+    // ---- minting Ordinals (a pool with a collection)
+    /** What minting `count` Ordinals costs now (`bitcoin`: for a Bitcoin wallet). */
+    ordCost: (pool: string, count = 1, o: { bitcoin?: boolean } = {}) =>
+      call<ApiOrdCost>(
+        `/v1/pools/${pool}/ord-cost?count=${count}${o.bitcoin ? '&btc=1' : ''}`,
+      ),
+    /** A wallet's mints (a Solana or bc1p address): where each is, its inscriptions once made. */
+    ordTakes: (wallet: string, pool?: string) =>
+      call<{ tip: number | null; takes: ApiOrdTake[] }>(
+        `/v1/wallets/${wallet}/ord-takes${pool ? `?pool=${encodeURIComponent(pool)}` : ''}`,
+      ),
+    /** A Solana wallet mints `count` Ordinals to the Taproot `address`: sign, then `solSend`. */
+    solOrdOpen: (o: {
+      pool: string;
+      wallet: string;
+      address: string;
+      count: number;
+    }) =>
+      call<ApiWalletTx & ApiOrdCost & { pool: string; id: string; to: string }>(
+        '/v1/sol/ord-open',
+        o,
+      ),
+    /** Cancels a Solana wallet's mint before its block (the Runes and fee back): sign, then `solSend`. */
+    solOrdCancel: (o: { pool: string; wallet: string; id: string | bigint }) =>
+      call<ApiWalletTx & { pool: string; id: string }>('/v1/sol/ord-cancel', o),
+    /**
+     * A Bitcoin wallet mints, step 1: the approval it signs for a one-time
+     * `session` key (to its own Taproot address). Easier: `openOrdinals`.
+     */
+    ordOpenOrder: (o: {
+      pool: string;
+      bitcoinAddress: string;
+      count: number;
+      session: string;
+    }) =>
+      call<
+        ApiOrdCost & {
+          id: string;
+          text: string;
+          pool: string;
+          to: string;
+          expiry: string;
+        }
+      >('/v1/relay/ord-open-order', o),
+    /** Step 2: the wallet's signature; returns the session key's message (then `sessionSubmit`). */
+    ordOpenSend: (o: { id: string; signature: string }) =>
+      call<{ id: string; message: string; expiresAt: number }>(
+        '/v1/relay/ord-open',
+        o,
+      ),
+    /**
+     * A Bitcoin wallet mints `count` Ordinals with ONE signed message
+     * (BIP-322): the approval covers exactly the burn plus the Runes sold
+     * for the fee, so the one-time key can do nothing else. Free of SOL.
+     */
+    async openOrdinals(o: {
+      pool: string;
+      bitcoinAddress: string;
+      count: number;
+      signMessage: (text: string) => Promise<string>;
+      session?: SessionKey;
+    }) {
+      const key = o.session ?? (await oneTimeSessionKey());
+      const order = await call<{ id: string; text: string }>(
+        '/v1/relay/ord-open-order',
+        {
+          pool: o.pool,
+          bitcoinAddress: o.bitcoinAddress,
+          count: o.count,
+          session: key.publicKey,
+        },
+      );
+      const signature = await o.signMessage(order.text);
+      const prepared = await call<{ id: string; message: string }>(
+        '/v1/relay/ord-open',
+        { id: order.id, signature },
+      );
+      const sig = await key.sign(fromB64(prepared.message));
+      return call<{ signature: string }>('/v1/relay/session-submit', {
+        id: prepared.id,
+        signature: toB64(sig),
+      });
+    },
+
+    // ---- Ordinals listed by their holders (Bitcoin PSBTs, no Solana)
+    /** Ordinals of the pool's collection listed by their holders, cheapest first. */
+    ordMarket: (pool: string) =>
+      call<ApiOrdMarket>(`/v1/pools/${pool}/ord-market`),
+    /** A wallet's Ordinals of the collection (`payment`: its BTC address, default the same). */
+    ordMarketWallet: (pool: string, address: string, payment?: string) =>
+      call<ApiOrdMarketWallet>(
+        `/v1/pools/${pool}/ord-market/wallet?address=${encodeURIComponent(address)}${payment ? `&payment=${encodeURIComponent(payment)}` : ''}`,
+      ),
+    /** Listing, step 1: the PSBT the seller signs (`priceSats` paid to `payTo`, default its address). */
+    ordListPrepare: (o: {
+      pool: string;
+      address: string;
+      publicKey: string;
+      txid: string;
+      vout: number;
+      priceSats: bigint;
+      payTo?: string;
+    }) => call<ApiOrdListPlan>('/v1/ord-market/list-prepare', o),
+    /** Step 2: the same terms and the signed PSBT: for sale. */
+    ordList: (o: {
+      pool: string;
+      address: string;
+      publicKey: string;
+      txid: string;
+      vout: number;
+      priceSats: bigint;
+      payTo?: string;
+      signedPsbt: string;
+    }) => call<{ listing: ApiOrdListing }>('/v1/ord-market/list', o),
+    /** Off the market: the seller signs `ordCancelMessage` (BIP-322) within 10 minutes. */
+    async ordListCancel(o: {
+      pool: string;
+      address: string;
+      id: number;
+      signMessage: (text: string) => Promise<string>;
+    }) {
+      const signedAt = new Date().toISOString();
+      const signature = await o.signMessage(
+        ordCancelMessage({ id: o.id, address: o.address, signedAt }),
+      );
+      return call<{ cancelled: number }>('/v1/ord-market/cancel', {
+        pool: o.pool,
+        address: o.address,
+        id: o.id,
+        signedAt,
+        signature,
+      });
+    },
+    /** Buying listings: the purchase to sign, or first a split of the buyer's BTC. */
+    ordBuyPrepare: (o: {
+      pool: string;
+      /** Where the Ordinals go (Taproot). */
+      ordAddress: string;
+      paymentAddress: string;
+      paymentPublicKey: string;
+      listingIds: number[];
+      feeRate?: number;
+    }) => call<ApiOrdBuyPlan>('/v1/ord-market/buy-prepare', o),
+    /** The signed split (kept, not sent yet): returns the purchase to sign. */
+    ordBuySplit: (o: { pool: string; quoteId: string; signedPsbt: string }) =>
+      call<
+        Extract<ApiOrdBuyPlan, { kind: 'buy' }> & {
+          splitTxid: string;
+          splitFeeSats: string;
+        }
+      >('/v1/ord-market/buy-split', o),
+    /** The signed purchase: completed with the sellers' signatures and sent. */
+    ordBuy: (o: { pool: string; quoteId: string; signedPsbt: string }) =>
+      call<{
+        txid: string;
+        splitTxid: string | null;
+        items: number[];
+        priceSats: string;
+      }>('/v1/ord-market/buy', o),
+
+    // ---- more for wallets
+    /** A Solana wallet's Runes to a Bitcoin address (Taproot or SegWit): sign, then `solSend`. */
+    solRunesOut: (o: {
+      pool: string;
+      wallet: string;
+      address: string;
+      amount: bigint;
+    }) =>
+      call<
+        ApiWalletTx & {
+          pool: string;
+          to: string;
+          amount: string;
+          feeRunes: string;
+          feeSats: string;
+          rentLamports: string;
+        }
+      >('/v1/sol/runes-out', o),
+    /**
+     * Adding BTC from a Bitcoin wallet in one payment: the PSBT paying
+     * NEAR, which swaps it to SOL at the wallet's own deposit address;
+     * Etchy's keeper then swaps that to WBTC in its balance.
+     */
+    btcInPrepare: (o: {
+      bitcoinAddress: string;
+      paymentAddress: string;
+      paymentPublicKey: string;
+      sats: bigint;
+    }) => call<ApiBtcInPlan>('/v1/btc-in/prepare', o),
+    /** The signed PSBT (within 30 minutes): sent on Bitcoin. */
+    btcInSend: (o: { unsignedTxid: string; signedPsbt: string }) =>
+      call<{ txid: string; depositAddress: string; sats: string }>(
+        '/v1/btc-in/send',
+        o,
+      ),
+    /** Where an add is (by NEAR's deposit address). */
+    btcIn: (depositAddress: string) =>
+      call<ApiBtcIn>(`/v1/btc-in/${encodeURIComponent(depositAddress)}`),
+    /** Pays a routed pool's creator fees out to its route now (anyone may ask; Etchy's relay pays the fee). */
+    claimFees: (pool: string) =>
+      call<{ signature: string; sats: string }>(
+        `/v1/pools/${pool}/claim-fees`,
+        {},
+      ),
+
+    // ---- Mined Runes
+    /** A Mined Rune's mine: the round now, the one before, the speed. */
+    mine: (pool: string) =>
+      call<ApiMine>(`/v1/mine/${encodeURIComponent(pool)}`),
+    /** One mining key's miner in a pool's mine. */
+    miner: (pool: string, authority: string) =>
+      call<ApiMiner>(`/v1/mine/${encodeURIComponent(pool)}/miner/${authority}`),
+    /** Every miner whose Runes go to `owner`, in every mine. */
+    minersOf: (owner: string) =>
+      call<{
+        owner: string;
+        miners: {
+          address: string;
+          mine: string;
+          authority: string;
+          unclaimed: string;
+          earned: string;
+          pendingRound: string | null;
+          results: string;
+        }[];
+      }>(`/v1/mine/owner/${owner}`),
+    /** The message a mining key signs (`authority`: its address); then `mineSubmit`. */
+    minePrepare: (o: ApiMineStep & { authority: string }) =>
+      call<ApiMineMessage>('/v1/mine/prepare', o),
+    /** The key's Ed25519 signature of that message (base64): sent once. */
+    mineSubmit: (o: { id: string; signature: string }) =>
+      call<{ signature: string }>('/v1/mine/submit', o),
+    /** Prepare, sign with the mining key, submit: open, mine (a found nonce), claim or withdraw. */
+    async mineSend(o: ApiMineStep & { key: SessionKey }) {
+      const { key, ...step } = o;
+      const m = await call<ApiMineMessage>('/v1/mine/prepare', {
+        ...step,
+        authority: key.publicKey,
+      });
+      const sig = await key.sign(fromB64(m.message));
+      return call<{ signature: string }>('/v1/mine/submit', {
+        id: m.id,
+        signature: toB64(sig),
+      });
+    },
+    /** A wallet funds its mining key (a plain SOL transfer): sign, then `solSend`. */
+    mineFund: (o: { wallet: string; authority: string; lamports: bigint }) =>
+      call<ApiWalletTx>('/v1/mine/fund', o),
+    /** Any wallet claims a miner's Runes for its owner (a lost key): sign, then `solSend`. */
+    mineClaimTx: (o: { wallet: string; pool: string; authority: string }) =>
+      call<ApiWalletTx>('/v1/mine/claim-tx', o),
   };
 }
 export type EtchyApi = ReturnType<typeof createEtchyApi>;

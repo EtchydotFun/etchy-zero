@@ -13,17 +13,22 @@ import {
 import { Buffer } from 'buffer';
 import { esplora } from './bitcoin.ts';
 import { base58, concat, le } from './borsh.ts';
+import { createTokenAccountIx, tokenAccount } from './client.ts';
+import { followPayload, shelfOfCollection } from './shelf.ts';
 import {
   createPoolRelayer,
   memoryPoolRelayerStore,
   type PoolRelayerBitcoin,
   type PoolRelayerChain,
+  type PoolRelayerPictures,
   type PoolRelayerStore,
   type PoolRelayerVault,
   type RelayerCoin,
   type RelayerNamedProof,
+  type RelayerOrdCoin,
   type RelayerPool,
   type RelayerProof,
+  type RelayerTake,
 } from './keeper.ts';
 import {
   accountDiscriminator,
@@ -730,11 +735,16 @@ export function solanaKeeperChain(o: {
           ],
         }),
       );
-      return list
+      // reserved[0]: registered; reserved[1]: an M123 picture take-out
+      // (its Runes were burned: no coin to register).
+      const ids = list
         .map((x) => decodeAccount<Raw>('Withdrawal', x.account.data))
-        .filter((w) => (w.reserved as Uint8Array)[0] === 0)
-        .map((w) => w.id as bigint)
-        .sort((a, b) => (a < b ? -1 : 1));
+        .filter((w) => {
+          const r = w.reserved as Uint8Array;
+          return r[0] === 0 && r[1] === 0;
+        })
+        .map((w) => w.id as bigint);
+      return ids.sort((a, b) => (a < b ? -1 : 1));
     },
     async registerCoin(pool: string, id: bigint) {
       const pk = new PublicKey(pool);
@@ -850,6 +860,234 @@ export function solanaKeeperChain(o: {
         'credit_deposit',
       );
     },
+    // ---- M123 Ordinal Runes
+    async ordTakes(pool: string): Promise<RelayerTake[] | null> {
+      const pk = new PublicKey(pool);
+      const ca = await account(pda.collection(pk));
+      if (!ca) return null;
+      const conf = decodeAccount<Raw>('Collection', ca.data)
+        .draw_confirmations as number;
+      const list = await rpc(() =>
+        conn.getProgramAccounts(PROGRAM_ID, {
+          commitment: 'confirmed',
+          filters: [
+            {
+              memcmp: {
+                offset: 0,
+                bytes: base58(accountDiscriminator('OrdTake')),
+              },
+            },
+            { memcmp: { offset: 10, bytes: pool } },
+          ],
+        }),
+      );
+      const takes = list.map((x) =>
+        decodeAccount<Raw>('OrdTake', x.account.data),
+      );
+      const out: RelayerTake[] = [];
+      for (let i = 0; i < takes.length; i += 100) {
+        const part = takes.slice(i, i + 100);
+        const ws = await rpc(() =>
+          conn.getMultipleAccountsInfo(
+            part.map((t) => pda.withdrawal(pk, t.withdrawal as bigint)),
+            'confirmed',
+          ),
+        );
+        part.forEach((t, j) => {
+          const wa = ws[j];
+          const w = wa ? decodeAccount<Raw>('Withdrawal', wa.data) : null;
+          const target = t.target as number;
+          out.push({
+            id: t.withdrawal as bigint,
+            count: t.count as number,
+            target,
+            drawableAt: target + conf - 1,
+            drawn: t.drawn as boolean,
+            items: [...(t.items as number[])],
+            status: w ? (w.status as number) : null,
+            settled: w ? (w.reserved as Uint8Array)[2] === 1 : false,
+          });
+        });
+      }
+      return out.sort((a, b) => (a.id < b.id ? -1 : 1));
+    },
+    async ordDraw(pool: string, id: bigint) {
+      const pk = new PublicKey(pool);
+      return send(
+        [
+          instruction(
+            'ord_draw',
+            {},
+            {
+              pool: pk,
+              collection: pda.collection(pk),
+              ord_take: pda.ordTake(pk, id),
+              bitcoin: pda.bitcoin(),
+              relay: (await bitcoinConfig()).relay,
+            },
+          ),
+        ],
+        'ord_draw',
+      );
+    },
+    async ordDelivered(pool: string, id: bigint) {
+      const pk = new PublicKey(pool);
+      const tk = await account(pda.ordTake(pk, id));
+      if (!tk) throw new Error(`take-out ${id} is gone`);
+      const t = decodeAccount<Raw>('OrdTake', tk.data);
+      const wk = pda.withdrawal(pk, id);
+      const wa = await account(wk);
+      if (!wa) throw new Error(`withdrawal ${id} is gone`);
+      const w = decodeAccount<Raw>('Withdrawal', wa.data);
+      // M129: each Ordinal's record, in drawn order (their rent was paid at
+      // the opening; this key adds only a shortfall if rent went up).
+      const records = (t.items as number[]).map((i) =>
+        writable(pda.ordCoin(pk, i)),
+      );
+      const ixs = [
+        instruction(
+          'ord_delivered',
+          {},
+          {
+            payer: me,
+            pool: pk,
+            collection: pda.collection(pk),
+            withdrawal: wk,
+            ord_take: pda.ordTake(pk, id),
+            rent_payer: t.rent_payer as PublicKey,
+          },
+          records,
+        ),
+      ];
+      // Nothing to register for a burn: its owner or rent payer may close
+      // the withdrawal at once (this key, when it paid the rent).
+      const payer = w.rent_payer as PublicKey;
+      if (payer.equals(me) || (w.owner as PublicKey).equals(me))
+        ixs.push(
+          instruction(
+            'close_withdrawal',
+            {},
+            { closer: me, withdrawal: wk, rent_payer: payer },
+          ),
+        );
+      return send(ixs, 'ord_delivered');
+    },
+    // ---- M129 the Ordinals shelf
+    async shelfScript(pool: string) {
+      const a = await rpc(() =>
+        conn.getAccountInfo(pda.collection(new PublicKey(pool)), 'confirmed'),
+      );
+      if (!a) return null;
+      const s = shelfOfCollection(
+        decodeAccount<Raw>('Collection', a.data).reserved as Uint8Array,
+      ).script;
+      return s.length ? s : null;
+    },
+    async ordCoins(pool: string): Promise<RelayerOrdCoin[]> {
+      const list = await rpc(() =>
+        conn.getProgramAccounts(PROGRAM_ID, {
+          commitment: 'confirmed',
+          filters: [
+            {
+              memcmp: {
+                offset: 0,
+                bytes: base58(accountDiscriminator('OrdCoin')),
+              },
+            },
+            { memcmp: { offset: 10, bytes: pool } },
+          ],
+        }),
+      );
+      return list
+        .map((x) => {
+          const c = decodeAccount<Raw>('OrdCoin', x.account.data);
+          const party = c.party as PublicKey;
+          return {
+            item: c.item as number,
+            state: c.state as number,
+            txid: display(c.txid as Uint8Array),
+            vout: c.vout as number,
+            hops: c.hops as number,
+            minSats: c.min_sats as bigint,
+            party: party.equals(PublicKey.default) ? null : party.toBase58(),
+          };
+        })
+        .sort((a, b) => a.item - b.item);
+    },
+    async ordFollow(
+      pool: string,
+      item: number,
+      p: RelayerProof,
+      input: number,
+      prevs: Uint8Array[],
+    ) {
+      const pk = new PublicKey(pool);
+      const payload = followPayload({
+        tx: p.rawTx,
+        branch: p.branch,
+        coinbase: p.coinbase
+          ? { tx: p.coinbase.rawTx, branch: p.coinbase.branch }
+          : null,
+        prevs,
+      });
+      const known = await knownBlocks([p.height]);
+      const relay = (await bitcoinConfig()).relay;
+      return inBuffer(
+        `ord-${pool}-${item}-${display(Uint8Array.from(p.txid))}`,
+        payload,
+        (buffer) =>
+          send(
+            [
+              instruction(
+                'ord_follow',
+                { height: p.height, index: p.index, input },
+                {
+                  prover: me,
+                  bitcoin: pda.bitcoin(),
+                  relay,
+                  pool: pk,
+                  collection: pda.collection(pk),
+                  ord_coin: pda.ordCoin(pk, item),
+                  buffer,
+                },
+                known,
+              ),
+            ],
+            'ord_follow',
+            [],
+            1_400_000,
+          ),
+      );
+    },
+    async ordSellBack(pool: string, item: number, party: string) {
+      const pk = new PublicKey(pool);
+      const pa = await account(pk);
+      if (!pa) throw new Error('no pool');
+      const pool_ = decodeAccount<Raw>('Pool', pa.data);
+      const ca = await account(pda.config());
+      const mint = decodeAccount<Raw>('Config', ca!.data)
+        .quote_mint as PublicKey;
+      const owner = new PublicKey(party);
+      return send(
+        [
+          createTokenAccountIx(me, owner, mint),
+          instruction(
+            'ord_sell_back',
+            {},
+            {
+              config: pda.config(),
+              pool: pk,
+              vault: pool_.vault as PublicKey,
+              destination: tokenAccount(owner, mint),
+              collection: pda.collection(pk),
+              ord_config: pda.ordConfig(),
+              ord_coin: pda.ordCoin(pk, item),
+            },
+          ),
+        ],
+        'ord_sell_back',
+      );
+    },
   };
 }
 
@@ -867,6 +1105,8 @@ export function createKeeper(o: {
   store?: PoolRelayerStore;
   lookupTable?: PublicKey;
   buffers?: ProofBufferStore;
+  /** M123: collections' pictures (their launch files) for drawn take-outs. */
+  pictures?: PoolRelayerPictures;
   log?: (line: string) => void;
 }) {
   return createPoolRelayer({
@@ -874,6 +1114,7 @@ export function createKeeper(o: {
     bitcoin: o.bitcoin ?? esplora(),
     vault: o.vault,
     store: o.store ?? memoryPoolRelayerStore(),
+    pictures: o.pictures,
     log: o.log,
   });
 }

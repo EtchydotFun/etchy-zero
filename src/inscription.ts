@@ -43,6 +43,10 @@ export interface RuneLaunchInfo {
   /** The wallet that launched it, and what it paid with. */
   deployer: string | null;
   paidWith: 'BTC' | 'SOL' | null;
+  /** M123 Ordinal Runes: its picture collection as inscribed (null: none). */
+  collection: string | null;
+  /** M123: the collection's fingerprint (Merkle root, 64 hex). */
+  collectionRoot: string | null;
 }
 /** `bc1q… 60%, bc1p… 40%` -> entries (null unless it adds up to 100%). */
 export function parseFeeRoute(
@@ -332,6 +336,10 @@ export function launchInfoOf(metadata: unknown): RuneLaunchInfo {
         : str('paidWith') === 'SOL'
           ? 'SOL'
           : null,
+    collection: str('collection', 120),
+    collectionRoot: /^[0-9a-f]{64}$/.test(str('collectionRoot', 64) ?? '')
+      ? str('collectionRoot', 64)
+      : null,
   };
 }
 

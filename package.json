@@ -1,7 +1,7 @@
 {
   "name": "@etchydotfun/rune-pool",
-  "version": "0.3.0",
-  "description": "TypeScript SDK for Etchy Zero, the AMM for real Bitcoin Runes on Solana: market data, quotes, trades from Solana and Bitcoin wallets, deposits, withdrawals and the keeper.",
+  "version": "0.5.0",
+  "description": "TypeScript SDK for Etchy Zero, the AMM for real Bitcoin Runes on Solana: market data, quotes, trades from Solana and Bitcoin wallets, deposits, withdrawals, Ordinal Runes, Mined Runes and the keeper.",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -73,6 +73,6 @@
   "bugs": {
     "url": "https://github.com/EtchydotFun/etchy-zero/issues"
   },
-  "keywords": ["bitcoin", "runes", "solana", "amm", "bonding-curve", "etchy", "etchy-zero", "wbtc"],
+  "keywords": ["bitcoin", "runes", "ordinals", "solana", "amm", "bonding-curve", "etchy", "etchy-zero", "wbtc"],
   "license": "Apache-2.0"
 }

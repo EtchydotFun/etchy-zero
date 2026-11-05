@@ -13,6 +13,7 @@ import { base58, Reader } from './borsh.ts';
 import {
   afterBuy,
   afterSell,
+  PoolMathError,
   priceE18,
   quoteBuy,
   quoteBuyExactOut,
@@ -32,11 +33,23 @@ import {
   poolNetwork,
   scriptAddress,
   sendWbtcMessage,
+  shelfMessage,
   taprootKey,
   tradeMessage,
   type PoolNetwork,
   type RuneLabel,
 } from './messages.ts';
+import {
+  buyLeavesShelf,
+  ORD_COIN_SPACE,
+  sellBackQuote,
+  shelfBuyQuote,
+  shelfFeeOf,
+  shelfOfCollection,
+  shelfRunesOf,
+  type SellBackQuote,
+  type ShelfBuyQuote,
+} from './shelf.ts';
 import {
   accountDiscriminator,
   decodeAccount,
@@ -171,8 +184,15 @@ export interface PoolState extends RuneLabel {
    * `firstBuyUntil` (unix seconds) passes, nobody trades. Null: none (or made).
    */
   firstBuy: { sats: bigint; buyer: PublicKey; until: number } | null;
+  /**
+   * Whose balance got (or gets) the creator's first buy: the creator's own
+   * balance, kept after the buy is made. Null: the pool had none.
+   */
+  firstBuyer: PublicKey | null;
   /** Its creator fees follow its fee route (`feeRouteOf`): anyone pays them out. */
   feeRouted: boolean;
+  /** M129: Rune units that are Ordinals on its shelf (never bought as Runes). */
+  shelfRunes: bigint;
 }
 export interface FeeRouteState {
   pool: PublicKey;
@@ -223,6 +243,127 @@ export interface WithdrawalState {
   /** Delivered and its output recorded: it can be closed (rent back). */
   closable: boolean;
   rentPayer: PublicKey;
+  /** M123: a picture opening (its Runes burned, no Bitcoin output of its own). */
+  ordinals: boolean;
+  /** M123: its pictures are out for good (`ord_delivered`). */
+  settled: boolean;
+}
+/** M123: `rune_pool::MAX_SEND`: pictures one opening takes out at most. */
+export const ORD_MAX_OPEN = 10;
+/** M123: `rune_pool::Collection::DECK_OFFSET` (one state byte per picture follows). */
+export const COLLECTION_DECK_OFFSET = 214;
+/** A picture's state in the deck: free, out for good (a real Ordinal), on its way. */
+export const ITEM_FREE = 0;
+export const ITEM_OUT = 2;
+export const ITEM_SENDING = 3;
+/** M123: a pool's picture collection, as the program keeps it. */
+export interface CollectionState {
+  address: PublicKey;
+  pool: PublicKey;
+  size: number;
+  /** Rune units burned per picture opened. */
+  unit: bigint;
+  /** The pictures' fingerprint (hex), inscribed with the logo. */
+  root: string;
+  /** The logo inscription every picture is a child of (`<txid>i<n>`). */
+  parent: string;
+  maxBytes: number;
+  drawDelay: number;
+  drawConfirmations: number;
+  free: number;
+  drawing: number;
+  sending: number;
+  out: number;
+  draws: bigint;
+  /** Each picture's state (`ITEM_*`). */
+  states: Uint8Array;
+  /** M129: the pool's Ordinals shelf (address null: not set yet). */
+  shelf: {
+    script: Uint8Array;
+    address: string | null;
+    onShelf: number;
+    selling: number;
+    leaving: number;
+    lost: number;
+  };
+}
+/** M129: one minted Ordinal, followed on Bitcoin by the program (`OrdCoin`). */
+export interface OrdCoinState {
+  address: PublicKey;
+  pool: PublicKey;
+  item: number;
+  /** `OC_*` (shelf.ts). */
+  state: number;
+  /** Where it is: `offset` sats into output `vout` of `txid` (display order); zeros until its reveal is recorded. */
+  txid: string;
+  vout: number;
+  offset: bigint;
+  /** That output's sats and script (null: longer than 34 bytes) and its Bitcoin address. */
+  value: bigint;
+  script: Uint8Array | null;
+  btcAddress: string | null;
+  height: number;
+  hops: number;
+  /** At the shelf: its seller; leaving it: its buyer or seller. */
+  party: PublicKey | null;
+  /** The seller's lowest price (sats). */
+  minSats: bigint;
+  /** Where it came to the shelf from (the seller's script). */
+  from: Uint8Array | null;
+  /** Leaving the shelf: where the vault sends it. */
+  to: Uint8Array | null;
+}
+/** M129: a pool's shelf now: where to sell, the fee, and both prices. */
+export interface ShelfInfo {
+  pool: PublicKey;
+  address: string | null;
+  script: Uint8Array;
+  feeBps: number;
+  unit: bigint;
+  shelfRunes: bigint;
+  onShelf: number;
+  selling: number;
+  leaving: number;
+  lost: number;
+  /** What the pool pays for one now (null: it cannot, e.g. not enough BTC in it). */
+  sellBack: SellBackQuote | null;
+  /** What one off the shelf costs now (null: none on it). */
+  buy: ShelfBuyQuote | null;
+}
+/** M123: what opening `count` pictures costs. */
+export interface OrdOpenCost {
+  count: number;
+  /** Rune units burned for good. */
+  burn: bigint;
+  /** WBTC sats per picture (inscribing it), and the batch's withdrawal fee. */
+  pictureFee: bigint;
+  withdrawalFee: bigint;
+  /** All the WBTC the program takes (sats). */
+  feeSats: bigint;
+  /** Pictures nobody opened yet. */
+  free: number;
+  /** M129: lamports for the Ordinals' records (rent, paid by the opener's Solana payer). */
+  recordRent: bigint;
+}
+/** M123: one opening (`OrdTake`) and its burn withdrawal (same id). */
+export interface OrdTakeState {
+  address: PublicKey;
+  pool: PublicKey;
+  id: bigint;
+  owner: PublicKey;
+  rentPayer: PublicKey;
+  count: number;
+  /** The Bitcoin block whose hash draws the pictures. */
+  target: number;
+  /** Drawable from this height on (the block and its confirmations). */
+  drawableAt: number;
+  retargeted: boolean;
+  drawn: boolean;
+  /** The pictures drawn (empty before). */
+  items: number[];
+  /** Where the pictures go (output script) and its address. */
+  script: Uint8Array;
+  to: string | null;
 }
 export interface TradeRecord {
   signature: string;
@@ -291,7 +432,39 @@ function poolState(address: PublicKey, p: Raw): PoolState {
             until: Number(p.first_buy_until as bigint),
           }
         : null,
+    firstBuyer: zeroKey(p.first_buyer as PublicKey)
+      ? null
+      : (p.first_buyer as PublicKey),
     feeRouted: p.fee_routed as boolean,
+    shelfRunes: shelfRunesOf(p.reserved as Uint8Array),
+  };
+}
+
+const displayTxid = (t: Uint8Array) => Buffer.from(t).reverse().toString('hex');
+async function ordCoinState(address: PublicKey, c: Raw): Promise<OrdCoinState> {
+  const sc = (len: number, bytes: Uint8Array) =>
+    len === 0xff ? null : Uint8Array.from(bytes.subarray(0, Math.min(len, 34)));
+  const script = sc(c.script_len as number, c.script as Uint8Array);
+  const from = sc(c.from_len as number, c.from as Uint8Array);
+  const to = sc(c.to_len as number, c.to as Uint8Array);
+  const party = c.party as PublicKey;
+  return {
+    address,
+    pool: c.pool as PublicKey,
+    item: c.item as number,
+    state: c.state as number,
+    txid: displayTxid(c.txid as Uint8Array),
+    vout: c.vout as number,
+    offset: c.offset as bigint,
+    value: c.value as bigint,
+    script,
+    btcAddress: script ? await scriptAddress(script).catch(() => null) : null,
+    height: c.height as number,
+    hops: c.hops as number,
+    party: zeroKey(party) ? null : party,
+    minSats: c.min_sats as bigint,
+    from: from && from.length ? from : null,
+    to: to && to.length ? to : null,
   };
 }
 
@@ -454,6 +627,9 @@ export function createRunePoolClient(o: {
       out = q.runeOut;
       fee = q.fee;
       after = afterBuy(before, q);
+      // M129: the Runes that are Ordinals on the shelf are never bought.
+      if (!buyLeavesShelf(after.rune, pool.shelfRunes))
+        throw new PoolMathError('InsufficientLiquidity');
     } else {
       const q: SellQuote = quoteSell(before, amountIn, mode.sell);
       out = q.btcOut;
@@ -764,6 +940,470 @@ export function createRunePoolClient(o: {
       ],
     };
   }
+  // ------------------------------------------------------------ M123 Ordinal Runes
+  /** The program's Bitcoin settings: its relay, confirmations, withdrawal fee. */
+  async function bitcoinSettings() {
+    const a = await account(pda.bitcoin());
+    if (!a) throw new Error('Bitcoin is not set up on this cluster');
+    const c = decodeAccount<Raw>('BitcoinConfig', a.data);
+    return {
+      relay: c.relay as PublicKey,
+      minConfirmations: c.min_confirmations as number,
+      withdrawalFee: c.withdrawal_fee as bigint,
+    };
+  }
+  /** A pool's picture collection (null: it has none). */
+  async function getCollection(
+    pool: PublicKey,
+  ): Promise<CollectionState | null> {
+    const address = pda.collection(pool);
+    const a = await account(address);
+    if (!a) return null;
+    const c = decodeAccount<Raw>('Collection', a.data);
+    const size = c.size as number;
+    const txid = Buffer.from(c.parent_txid as Uint8Array)
+      .reverse()
+      .toString('hex');
+    return {
+      address,
+      pool,
+      size,
+      unit: c.unit as bigint,
+      root: Buffer.from(c.root as Uint8Array).toString('hex'),
+      parent: `${txid}i${c.parent_index as number}`,
+      maxBytes: c.max_bytes as number,
+      drawDelay: c.draw_delay as number,
+      drawConfirmations: c.draw_confirmations as number,
+      free: c.free as number,
+      drawing: c.drawing as number,
+      sending: c.sending as number,
+      out: c.out as number,
+      draws: c.draws as bigint,
+      states: Uint8Array.from(
+        a.data.subarray(COLLECTION_DECK_OFFSET, COLLECTION_DECK_OFFSET + size),
+      ),
+      shelf: (() => {
+        const s = shelfOfCollection(c.reserved as Uint8Array);
+        return {
+          ...s,
+          address: s.script.length ? p2trAddress(s.script) : null,
+        };
+      })(),
+    };
+  }
+  /**
+   * What opening `count` pictures costs (`rune_pool::picture_fee`): the
+   * Runes burned, and the WBTC the program takes (the batch's withdrawal fee
+   * + each picture's fee, priced for the collection's biggest picture).
+   */
+  async function ordOpenCost(
+    pool: PublicKey,
+    count: number,
+  ): Promise<OrdOpenCost> {
+    if (!Number.isInteger(count) || count < 1 || count > ORD_MAX_OPEN)
+      throw new Error(`open 1 to ${ORD_MAX_OPEN} pictures at a time`);
+    const [c, oc, b, rent] = await Promise.all([
+      getCollection(pool),
+      account(pda.ordConfig()),
+      bitcoinSettings(),
+      conn.getMinimumBalanceForRentExemption(ORD_COIN_SPACE, 'confirmed'),
+    ]);
+    if (!c) throw new Error('this pool has no picture collection');
+    if (!oc) throw new Error('the picture fee is not set yet');
+    const o = decodeAccount<Raw>('OrdConfig', oc.data);
+    const pictureFee =
+      (o.send_fee as bigint) +
+      (o.byte_fee as bigint) * BigInt(Math.ceil(c.maxBytes / 1_000));
+    return {
+      count,
+      burn: c.unit * BigInt(count),
+      pictureFee,
+      withdrawalFee: b.withdrawalFee,
+      feeSats: b.withdrawalFee + pictureFee * BigInt(count),
+      free: c.free,
+      recordRent: BigInt(rent) * BigInt(count),
+    };
+  }
+  /**
+   * Opens `count` pictures to a Taproot address (`script`: 51 20 <key>):
+   * `count` units of Runes burned for good, the pictures drawn by a later
+   * Bitcoin block, each inscribed alone to that address. The WBTC fee is
+   * paid from `feeToken` (default: the payer's WBTC account).
+   */
+  async function ordTakeOut(p: {
+    pool: PoolState;
+    signer: PublicKey;
+    owner?: PublicKey;
+    count: number;
+    script: Uint8Array;
+    payer?: PublicKey;
+    feeToken?: PublicKey;
+  }) {
+    if (!Number.isInteger(p.count) || p.count < 1 || p.count > ORD_MAX_OPEN)
+      throw new Error(`open 1 to ${ORD_MAX_OPEN} pictures at a time`);
+    if (!p2trAddress(p.script))
+      throw new Error('pictures go to a Taproot address (bc1p...)');
+    const [cfg, v, b] = await Promise.all([
+      getConfig(),
+      getVault(p.pool.address),
+      bitcoinSettings(),
+    ]);
+    if (!v) throw new Error('this pool has no Bitcoin vault');
+    const owner = p.owner ?? p.signer;
+    const payer = p.payer ?? p.signer;
+    return {
+      id: v.nextWithdrawal,
+      instructions: [
+        instruction(
+          'ord_take_out',
+          { count: p.count, script: p.script },
+          {
+            signer: p.signer,
+            payer,
+            bitcoin: pda.bitcoin(),
+            relay: b.relay,
+            pool: p.pool.address,
+            vault: p.pool.vault,
+            btc_vault: pda.btcVault(p.pool.address),
+            balance: pda.balance(p.pool.address, owner),
+            collection: pda.collection(p.pool.address),
+            ord_config: pda.ordConfig(),
+            withdrawal: pda.withdrawal(p.pool.address, v.nextWithdrawal),
+            ord_take: pda.ordTake(p.pool.address, v.nextWithdrawal),
+            fee_token: p.feeToken ?? tokenAccount(payer, cfg.quoteMint),
+          },
+        ),
+      ],
+    };
+  }
+  function ordTakeState(address: PublicKey, t: Raw, conf: number) {
+    const script = (t.to as Uint8Array).subarray(0, t.to_len as number);
+    const target = t.target as number;
+    return {
+      address,
+      pool: t.pool as PublicKey,
+      id: t.withdrawal as bigint,
+      owner: t.owner as PublicKey,
+      rentPayer: t.rent_payer as PublicKey,
+      count: t.count as number,
+      target,
+      drawableAt: target + Math.max(1, conf) - 1,
+      retargeted: t.retargeted as boolean,
+      drawn: t.drawn as boolean,
+      items: [...(t.items as number[])],
+      script: Uint8Array.from(script),
+      to: p2trAddress(script),
+    } satisfies OrdTakeState;
+  }
+  /**
+   * An owner's openings still on record (a Solana wallet, or a Bitcoin
+   * wallet's owner address), newest first; `pool` narrows to one pool
+   * (owner null: every opening of `pool`). Settled ones are closed by the
+   * keeper (gone).
+   */
+  async function ordTakesOf(owner: PublicKey | null, pool?: PublicKey) {
+    const filters = [
+      {
+        memcmp: { offset: 0, bytes: base58(accountDiscriminator('OrdTake')) },
+      },
+    ];
+    if (owner)
+      filters.push({ memcmp: { offset: 50, bytes: owner.toBase58() } });
+    if (pool) filters.push({ memcmp: { offset: 10, bytes: pool.toBase58() } });
+    if (!owner && !pool) throw new Error('an owner or a pool');
+    const list = await conn.getProgramAccounts(programId, {
+      commitment: 'confirmed',
+      filters,
+    });
+    const confs = new Map<string, number>();
+    const out: OrdTakeState[] = [];
+    for (const x of list) {
+      const t = decodeAccount<Raw>('OrdTake', x.account.data);
+      const pk = (t.pool as PublicKey).toBase58();
+      if (!confs.has(pk))
+        confs.set(
+          pk,
+          (await getCollection(t.pool as PublicKey))?.drawConfirmations ?? 1,
+        );
+      out.push(ordTakeState(x.pubkey, t, confs.get(pk)!));
+    }
+    return out.sort((a, b) => (a.id < b.id ? 1 : -1));
+  }
+  async function getOrdTake(pool: PublicKey, id: bigint) {
+    const address = pda.ordTake(pool, id);
+    const a = await account(address);
+    if (!a) return null;
+    const conf = (await getCollection(pool))?.drawConfirmations ?? 1;
+    return ordTakeState(address, decodeAccount<Raw>('OrdTake', a.data), conf);
+  }
+  /**
+   * Cancels an opening before its Bitcoin block is mined (and before its
+   * burn is in a batch): the Runes back to the balance, the WBTC fee back to
+   * `refundTo` (default: the owner's WBTC account, opened if needed), both
+   * records' rent back to whoever paid it.
+   */
+  async function ordTakeCancel(p: {
+    pool: PoolState;
+    id: bigint;
+    signer: PublicKey;
+    payer?: PublicKey;
+    refundTo?: PublicKey;
+  }) {
+    const [w, t, cfg, b] = await Promise.all([
+      getWithdrawal(p.pool.address, p.id),
+      getOrdTake(p.pool.address, p.id),
+      getConfig(),
+      bitcoinSettings(),
+    ]);
+    if (!w || !t) throw new Error(`no opening ${p.id}`);
+    if (w.status !== 'pending' || t.drawn)
+      throw new Error(`opening ${p.id} is on its way: too late to cancel`);
+    const payer = p.payer ?? p.signer;
+    const ixs: TransactionInstruction[] = [];
+    const refundTo = p.refundTo ?? tokenAccount(w.owner, cfg.quoteMint);
+    if (!p.refundTo)
+      ixs.push(createTokenAccountIx(payer, w.owner, cfg.quoteMint));
+    ixs.push(
+      instruction(
+        'ord_take_cancel',
+        {},
+        {
+          signer: p.signer,
+          payer,
+          bitcoin: pda.bitcoin(),
+          relay: b.relay,
+          pool: p.pool.address,
+          vault: p.pool.vault,
+          btc_vault: pda.btcVault(p.pool.address),
+          withdrawal: w.address,
+          ord_take: t.address,
+          rent_payer: t.rentPayer,
+          balance: pda.balance(p.pool.address, w.owner),
+          collection: pda.collection(p.pool.address),
+          refund_to: refundTo,
+        },
+      ),
+    );
+    return ixs;
+  }
+
+  // ------------------------------------------------------ M129 the Ordinals shelf
+  /** One minted Ordinal's record (null: not delivered yet, or never minted). */
+  async function getOrdCoin(pool: PublicKey, item: number) {
+    const address = pda.ordCoin(pool, item);
+    const a = await account(address);
+    return a
+      ? ordCoinState(address, decodeAccount<Raw>('OrdCoin', a.data))
+      : null;
+  }
+  /** Every minted Ordinal's record of a pool, by collection index. */
+  async function ordCoinsOf(pool: PublicKey): Promise<OrdCoinState[]> {
+    const list = await conn.getProgramAccounts(programId, {
+      commitment: 'confirmed',
+      filters: [
+        {
+          memcmp: { offset: 0, bytes: base58(accountDiscriminator('OrdCoin')) },
+        },
+        { memcmp: { offset: 10, bytes: pool.toBase58() } },
+      ],
+    });
+    const out = await Promise.all(
+      list.map((x) =>
+        ordCoinState(x.pubkey, decodeAccount<Raw>('OrdCoin', x.account.data)),
+      ),
+    );
+    return out.sort((a, b) => a.item - b.item);
+  }
+  /** The shelf fee (bps): the fee authority's, else 5%. */
+  async function shelfFee() {
+    const a = await account(pda.ordConfig());
+    return a
+      ? shelfFeeOf(
+          decodeAccount<Raw>('OrdConfig', a.data).reserved as Uint8Array,
+        )
+      : 500;
+  }
+  /**
+   * A pool's shelf now: its address (null until the vault sets it), the fee,
+   * what the pool pays for an Ordinal and what one off the shelf costs.
+   */
+  async function getShelf(pool: PoolState): Promise<ShelfInfo | null> {
+    const [c, feeBps, mode] = await Promise.all([
+      getCollection(pool.address),
+      shelfFee(),
+      fees(pool).catch(() => null),
+    ]);
+    if (!c) return null;
+    const tryQ = <T>(f: () => T) => {
+      try {
+        return f();
+      } catch {
+        return null;
+      }
+    };
+    return {
+      pool: pool.address,
+      address: c.shelf.address,
+      script: c.shelf.script,
+      feeBps,
+      unit: c.unit,
+      shelfRunes: pool.shelfRunes,
+      onShelf: c.shelf.onShelf,
+      selling: c.shelf.selling,
+      leaving: c.shelf.leaving,
+      lost: c.shelf.lost,
+      sellBack: mode
+        ? tryQ(() => sellBackQuote(pool.reserves, c.unit, mode.sell, feeBps))
+        : null,
+      buy:
+        mode && pool.shelfRunes >= c.unit
+          ? tryQ(() =>
+              shelfBuyQuote(pool.reserves, c.unit, mode.buy, pool.shelfRunes),
+            )
+          : null,
+    };
+  }
+  const shelfAccounts = (pool: PoolState, item: number) => ({
+    config: pda.config(),
+    pool: pool.address,
+    vault: pool.vault,
+    collection: pda.collection(pool.address),
+    ord_config: pda.ordConfig(),
+    ord_coin: pda.ordCoin(pool.address, item),
+  });
+  /**
+   * Anyone: an Ordinal at the shelf sold to the pool for its seller (the
+   * memo's owner), at the price now, never below the seller's lowest price.
+   * `payer` opens the seller's WBTC account if it has none.
+   */
+  async function ordSellBack(p: {
+    pool: PoolState;
+    item: number;
+    payer: PublicKey;
+  }) {
+    const [cfg, coin] = await Promise.all([
+      getConfig(),
+      getOrdCoin(p.pool.address, p.item),
+    ]);
+    if (!coin?.party)
+      throw new Error(`Ordinal #${p.item + 1} is not being sold`);
+    return [
+      createTokenAccountIx(p.payer, coin.party, cfg.quoteMint),
+      instruction(
+        'ord_sell_back',
+        {},
+        {
+          ...shelfAccounts(p.pool, p.item),
+          destination: tokenAccount(coin.party, cfg.quoteMint),
+        },
+      ),
+    ];
+  }
+  /**
+   * A Solana wallet at the shelf: sell its Ordinal now for at least
+   * `amount` sats (SHELF_SELL), take it back unsold (SHELF_RETURN), or buy
+   * one for at most `amount` sats of its WBTC, sent to `script` (SHELF_BUY).
+   */
+  async function ordShelf(p: {
+    pool: PoolState;
+    item: number;
+    signer: PublicKey;
+    action: number;
+    amount: bigint;
+    script?: Uint8Array;
+  }) {
+    const cfg = await getConfig();
+    return [
+      createTokenAccountIx(p.signer, p.signer, cfg.quoteMint),
+      instruction(
+        'ord_shelf',
+        {
+          action: p.action,
+          amount: p.amount,
+          script: p.script ?? new Uint8Array(),
+        },
+        {
+          signer: p.signer,
+          ...shelfAccounts(p.pool, p.item),
+          wbtc: tokenAccount(p.signer, cfg.quoteMint),
+        },
+      ),
+    ];
+  }
+  /** The text a Bitcoin wallet signs at the shelf; then `btcShelf` with the signature. */
+  async function btcShelfOrder(p: {
+    pool: PoolState;
+    bitcoinAddress: string;
+    item: number;
+    action: number;
+    amount: bigint;
+    seconds?: number;
+  }) {
+    const b = await btcOrderBasics(p.bitcoinAddress, p.seconds ?? 120);
+    return {
+      text: shelfMessage(
+        b.network,
+        p.pool,
+        p.action,
+        p.item,
+        p.amount,
+        b.nonce,
+        b.expiry,
+      ),
+      nonce: b.nonce,
+      expiry: b.expiry,
+    };
+  }
+  /**
+   * A Bitcoin wallet at the shelf, as it signed (`signature`: the 64-byte
+   * Schnorr signature inside its BIP-322 signature). A buy is paid from the
+   * wallet's Etchy balance and goes to its own Taproot address. `submitter`
+   * pays the Solana fee.
+   */
+  async function btcShelf(p: {
+    pool: PoolState;
+    bitcoinKey: Uint8Array;
+    item: number;
+    action: number;
+    amount: bigint;
+    nonce: bigint;
+    expiry: bigint;
+    signature: Uint8Array;
+    submitter: PublicKey;
+  }) {
+    const cfg = await getConfig();
+    const owner = pda.btcOwner(p.bitcoinKey);
+    const ixs: TransactionInstruction[] = [];
+    if (!(await account(owner)))
+      ixs.push(
+        instruction(
+          'btc_owner_open',
+          { key: p.bitcoinKey },
+          { payer: p.submitter, btc_owner: owner },
+        ),
+      );
+    ixs.push(createTokenAccountIx(p.submitter, owner, cfg.quoteMint));
+    ixs.push(
+      instruction(
+        'btc_shelf',
+        {
+          action: p.action,
+          amount: p.amount,
+          nonce: p.nonce,
+          expiry: p.expiry,
+          signature: p.signature,
+        },
+        {
+          submitter: p.submitter,
+          btc_owner: owner,
+          ...shelfAccounts(p.pool, p.item),
+          wbtc: tokenAccount(owner, cfg.quoteMint),
+        },
+      ),
+    );
+    return ixs;
+  }
+
   /** Where and how to send Runes back from Bitcoin so they are credited to `owner` (1-2 blocks). */
   async function depositInfo(pool: PublicKey, owner: PublicKey) {
     const v = await getVault(pool);
@@ -1078,8 +1718,16 @@ export function createRunePoolClient(o: {
         : null,
       vout: delivered ? (w.vout as number) : null,
       deliveredHeight: delivered ? (w.delivered_height as number) : null,
-      closable: delivered && (w.reserved as Uint8Array)[0] === 1,
+      // A delivered withdrawal whose coin is recorded, or (M123) a picture
+      // opening's burn once its pictures are settled (nothing to record).
+      closable:
+        delivered &&
+        ((w.reserved as Uint8Array)[0] === 1 ||
+          ((w.reserved as Uint8Array)[1] === 1 &&
+            (w.reserved as Uint8Array)[2] === 1)),
       rentPayer: w.rent_payer as PublicKey,
+      ordinals: (w.reserved as Uint8Array)[1] === 1,
+      settled: (w.reserved as Uint8Array)[2] === 1,
     };
   }
   async function getWithdrawal(pool: PublicKey, id: bigint) {
@@ -1542,6 +2190,21 @@ export function createRunePoolClient(o: {
     claimRouteFees,
     getVault,
     requestWithdrawal,
+    bitcoinSettings,
+    getCollection,
+    ordOpenCost,
+    ordTakeOut,
+    ordTakesOf,
+    getOrdTake,
+    ordTakeCancel,
+    getOrdCoin,
+    ordCoinsOf,
+    shelfFee,
+    getShelf,
+    ordSellBack,
+    ordShelf,
+    btcShelfOrder,
+    btcShelf,
     depositInfo,
     bitcoinWallet,
     btcTrade,

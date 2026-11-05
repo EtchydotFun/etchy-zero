@@ -460,12 +460,76 @@ export function priceBefore(
   return priceE18(before, divisibility);
 }
 
+/** A holder's trading in one pool, from its trades. */
+export interface HolderActivity {
+  /**
+   * Holding since (unix seconds): the buy after which its traded Runes never
+   * went back to zero. Null: its trades alone do not show it holding (its
+   * Runes came from a transfer or a deposit).
+   */
+  since: number | null;
+  firstTrade: number;
+  lastTrade: number;
+  buys: number;
+  sells: number;
+  /** WBTC sats it paid for its buys, and got for its sales. */
+  boughtSats: bigint;
+  soldSats: bigint;
+  boughtRunes: bigint;
+  soldRunes: bigint;
+}
+/** Each owner's activity from a pool's trades (oldest first). */
+export function holderActivity(
+  trades: IndexedTrade[],
+): Map<string, HolderActivity> {
+  const m = new Map<string, HolderActivity>();
+  // Runes each owner's trades left it (transfers and deposits are not trades).
+  const net = new Map<string, bigint>();
+  for (const t of trades) {
+    let a = m.get(t.owner);
+    if (!a) {
+      a = {
+        since: null,
+        firstTrade: t.time,
+        lastTrade: t.time,
+        buys: 0,
+        sells: 0,
+        boughtSats: 0n,
+        soldSats: 0n,
+        boughtRunes: 0n,
+        soldRunes: 0n,
+      };
+      m.set(t.owner, a);
+    }
+    a.lastTrade = t.time;
+    let n = net.get(t.owner) ?? 0n;
+    if (t.side === 'buy') {
+      // Starts holding (again) with this buy.
+      if (n <= 0n) a.since = t.time;
+      n += t.runeAmount;
+      a.buys++;
+      a.boughtSats += t.btcAmount;
+      a.boughtRunes += t.runeAmount;
+    } else {
+      n -= t.runeAmount;
+      a.sells++;
+      a.soldSats += t.btcAmount;
+      a.soldRunes += t.runeAmount;
+      if (n <= 0n) a.since = null;
+    }
+    net.set(t.owner, n);
+  }
+  return m;
+}
+
 export interface PoolHolder {
   /** The balance owner on Solana. */
   owner: string;
   /** Set when the owner is a Bitcoin wallet's balance (its bc1p address). */
   bitcoinAddress: string | null;
   amount: bigint;
+  /** Its trades in this pool (null: none indexed). */
+  activity?: HolderActivity | null;
 }
 export interface PoolHolders {
   supply: bigint;
@@ -773,11 +837,16 @@ export function createPoolIndexer(o: {
       if (d.status === WD_PENDING || d.status === WD_IN_BATCH)
         toBitcoin += d.amount as bigint;
     }
+    const act = holderActivity(ix.trades);
     return {
       supply: ix.supply,
       divisibility: ix.divisibility,
       curve: decodeAccount<Raw>('Pool', pa.data).rune_reserve as bigint,
-      holders: list.map((h) => ({ ...h, bitcoinAddress: btc(h.owner) })),
+      holders: list.map((h) => ({
+        ...h,
+        bitcoinAddress: btc(h.owner),
+        activity: act.get(h.owner) ?? null,
+      })),
       toBitcoin,
     };
   }

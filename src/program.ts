@@ -207,6 +207,16 @@ export const pda = {
     find([enc('block'), relay.toBytes(), le(height, 4)]),
   coin: (pool: PublicKey, txid: Uint8Array, vout: number) =>
     find([enc('coin'), pool.toBytes(), txid, le(vout, 4)]),
+  /** M123: a pool's picture collection (Ordinal Runes). */
+  collection: (pool: PublicKey) => find([enc('collection'), pool.toBytes()]),
+  /** M123: a picture take-out (its burn withdrawal has the same id). */
+  ordTake: (pool: PublicKey, id: bigint | number) =>
+    find([enc('ord_take'), pool.toBytes(), le(id, 8)]),
+  /** M123: the picture fee (set by the vault canister). */
+  ordConfig: () => find([enc('ord_config')]),
+  /** M129: one minted Ordinal, followed on Bitcoin (its collection index). */
+  ordCoin: (pool: PublicKey, item: number) =>
+    find([enc('ord_coin'), pool.toBytes(), le(item, 2)]),
 };
 
 export { concat };

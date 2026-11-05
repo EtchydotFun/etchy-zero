@@ -49,6 +49,13 @@
 import { displayTxid, sha256d } from './bitcoin.ts';
 import { hex } from './borsh.ts';
 import { decipherRunestone, reservedRune, type Artifact } from './runestone.ts';
+import {
+  MAX_INPUTS_BEFORE,
+  OC_AWAITING,
+  OC_HELD,
+  OC_LEAVING,
+  OC_SELLING,
+} from './shelf.ts';
 
 export const M83_POOL_RELAYER_POLICY = Object.freeze({
   /** Headers per tick at most (catch-up), sent 12 per transaction. */
@@ -84,6 +91,14 @@ export const M83_POOL_RELAYER_POLICY = Object.freeze({
   withdrawalFeeSeconds: 900,
   /** A batch that waits for Bitcoin fees (`WaitingUntil`) is asked again by then, within this at most. */
   waitingRetryMaxSeconds: 3_600,
+  /** M129: minted Ordinals' coins checked on Bitcoin per pool per tick (round robin; leaving ones every tick). */
+  ordChecksPerTick: 25,
+  /** M129: a held Ordinal's coin is checked again this often. */
+  ordRecheckSeconds: 600,
+  /** M129: ...and this often once it is spent, until that spend has its confirmations. */
+  ordSpentRecheckSeconds: 60,
+  /** M129: a follow proof's bytes at most (the previous transactions of the inputs before the Ordinal). */
+  ordFollowMaxBytes: 200_000,
 });
 /**
  * `ProvenTx.units` of a vault transaction (`prove_vault_spend` marks it):
@@ -231,6 +246,70 @@ export interface PoolRelayerChain {
     outputs: number[],
   ): Promise<string>;
   creditDeposit(pool: string, coin: RelayerCoin): Promise<string>;
+  /**
+   * M123: the pool's picture take-outs (`OrdTake`, with their burn
+   * withdrawals' state); null: the pool has no collection.
+   */
+  ordTakes?(pool: string): Promise<RelayerTake[] | null>;
+  /** `ord_draw` (anyone, once its block has its confirmations). */
+  ordDraw?(pool: string, id: bigint): Promise<string>;
+  /** `ord_delivered` then `close_withdrawal` (the rents back to their payer). */
+  ordDelivered?(pool: string, id: bigint): Promise<string>;
+  /** M129: the pool's minted Ordinals' records. */
+  ordCoins?(pool: string): Promise<RelayerOrdCoin[]>;
+  /**
+   * M129 `ord_follow`: `proof` spends the Ordinal's coin at `input`;
+   * `prevs`: the previous transactions of inputs `0..input` (whole).
+   */
+  ordFollow?(
+    pool: string,
+    item: number,
+    proof: RelayerProof,
+    input: number,
+    prevs: Uint8Array[],
+  ): Promise<string>;
+  /** M129 `ord_sell_back`: pays `party` (opens its WBTC account if needed). */
+  ordSellBack?(pool: string, item: number, party: string): Promise<string>;
+  /** M129: the pool's shelf script (null: not set yet). */
+  shelfScript?(pool: string): Promise<Uint8Array | null>;
+}
+/** M129: a minted Ordinal's record, as the keeper needs it. */
+export interface RelayerOrdCoin {
+  item: number;
+  /** `OC_*` (shelf.ts). */
+  state: number;
+  /** Its coin (display txid); all zeros until its reveal is recorded. */
+  txid: string;
+  vout: number;
+  hops: number;
+  minSats: bigint;
+  party: string | null;
+}
+/** M123: a picture take-out and its burn withdrawal. */
+export interface RelayerTake {
+  id: bigint;
+  count: number;
+  /** The Bitcoin block that draws it; `ord_draw` works from `drawableAt` (relay tip). */
+  target: number;
+  drawableAt: number;
+  drawn: boolean;
+  items: number[];
+  /** Its withdrawal: 0 pending, 1 in a batch, 2 delivered; null: closed. */
+  status: number | null;
+  /** `ord_delivered` done (the pictures are out for good). */
+  settled: boolean;
+}
+/** M123: one drawn picture for the vault canister, with its proof against the collection's root. */
+export interface RelayerPicture {
+  index: number;
+  contentType: string;
+  content: Uint8Array;
+  proof: Uint8Array[];
+}
+/** M123: where a keeper finds collections' pictures (their launch files). */
+export interface PoolRelayerPictures {
+  /** The pictures `items` of the pool's collection; null: this keeper does not have them. */
+  pictures(pool: string, items: number[]): Promise<RelayerPicture[] | null>;
 }
 export interface PoolRelayerBitcoin {
   tip(): Promise<number>;
@@ -245,6 +324,10 @@ export interface PoolRelayerBitcoin {
   ): Promise<{ txid: string; height: number | null } | null>;
   /** The proof of a confirmed transaction; null: not confirmed. */
   prove(txid: string): Promise<RelayerProof | null>;
+  /** M129: a transaction without its witness (checked against its txid). */
+  rawTx?(txid: string): Promise<Uint8Array>;
+  /** M129: the coins spent by the newest transactions paying to `script` (mempool and recent blocks). */
+  scriptSpends?(script: Uint8Array): Promise<{ txid: string; vout: number }[]>;
   /** Sat/vB for confirmation within about half an hour. */
   feeRate(): Promise<number>;
   /** The proof that this confirmed etching committed to `rune` (null: not found). */
@@ -273,6 +356,31 @@ export interface PoolRelayerVault {
    * signature. `FEE_UNCHANGED` / `FEE_SET_RECENTLY`: nothing to do.
    */
   withdrawalFee?(): Promise<string>;
+  /** M123: take-outs whose pictures the canister holds (`held`) or is revealing; reveals waiting. */
+  ordState?(
+    pool: string,
+  ): Promise<{ held: bigint[]; revealing: bigint[]; reveals: number }>;
+  /** M123: a drawn take-out's pictures handed in (checked by the canister). */
+  ordPictures?(
+    pool: string,
+    id: bigint,
+    pictures: RelayerPicture[],
+  ): Promise<string>;
+  /** M123: the pool's next reveal (signed and sent by the canister once its batch is in a block). */
+  reveal?(
+    pool: string,
+  ): Promise<{ txid: string; state: string; batch: bigint }>;
+  /** M123: the program's picture fee from the Bitcoin fee rate (`ORD_FEE_UNCHANGED` / `ORD_FEE_SET_RECENTLY`: nothing to do). */
+  ordFee?(): Promise<string>;
+  /** M129: the pool's shelf address set in the program (once: `SHELF_SET` after). */
+  setShelf?(pool: string): Promise<string>;
+  /** M129: where the reveals put the pool's Ordinals, told to the program (`NOTHING_TO_RECORD` / `WAITING_DELIVERED`: nothing now). */
+  ordGenesis?(pool: string): Promise<string>;
+  /** M129: an Ordinal leaving the shelf sent from its own coin (`NOT_LEAVING`: done or not yet). */
+  shelfSend?(
+    pool: string,
+    item: number,
+  ): Promise<{ txid: string; state: string }>;
 }
 export interface RelayerRecord {
   /** The vault is (true) or is not (false) this canister's; unknown if absent. */
@@ -285,6 +393,8 @@ export interface RelayerRecord {
   txids?: string[];
   /** A Bitcoin transaction that cannot be proven (too many inputs/outputs, proven before). */
   stuck?: boolean;
+  /** Done once for good (M129: the pool's shelf address is set). */
+  done?: boolean;
 }
 
 // ---------------------------------------------------------------- ord, for one Rune
@@ -413,6 +523,8 @@ export function createPoolRelayer(d: {
   bitcoin: PoolRelayerBitcoin;
   vault: PoolRelayerVault;
   store: PoolRelayerStore;
+  /** M123: collections' pictures (for drawn take-outs); without it the keeper only draws, reveals and settles. */
+  pictures?: PoolRelayerPictures;
   now?: () => number;
   log?: (line: string) => void;
   policy?: M83PoolRelayerPolicy;
@@ -760,6 +872,250 @@ export function createPoolRelayer(d: {
     }
   }
 
+  /**
+   * M123 Ordinal Runes, one pool with a collection: draw take-outs whose
+   * block is confirmed, hand the canister the drawn pictures (it checks
+   * them), ask for the reveal of a batch in a block, settle delivered ones.
+   * Each take-out on its own: one failing never holds up the others.
+   * Returns whether the pool has a collection.
+   */
+  async function ordinals(pool: RelayerPool, tip: number): Promise<boolean> {
+    if (!d.chain.ordTakes || !pool.vault || pool.vault.alarm) return false;
+    const takes = await d.chain.ordTakes(pool.pool);
+    if (takes === null) return false;
+    const name = short(pool.pool);
+    const okay = async (what: string, f: () => Promise<string>) => {
+      try {
+        log(`${name}: ${what} ${await f()}`);
+        return true;
+      } catch (e) {
+        log(`${name}: ${what}: ${msg(e)}`);
+        return false;
+      }
+    };
+    const vs =
+      takes.length && d.vault.ordState
+        ? await d.vault.ordState(pool.pool)
+        : null;
+    for (const t of takes) {
+      if (!t.drawn) {
+        if (d.chain.ordDraw && tip >= t.drawableAt)
+          await okay(`take-out ${t.id} drawn`, () =>
+            d.chain.ordDraw!(pool.pool, t.id),
+          );
+        continue;
+      }
+      if (t.status === 0 || t.status === 1) {
+        if (!vs || !d.pictures || !d.vault.ordPictures) continue;
+        if (vs.held.includes(t.id) || vs.revealing.includes(t.id)) continue;
+        const pics = await d.pictures.pictures(pool.pool, t.items);
+        if (!pics) continue;
+        const given = await okay(
+          `take-out ${t.id} pictures ${t.items.join(',')}`,
+          () => d.vault.ordPictures!(pool.pool, t.id, pics),
+        );
+        // Its batch may go now: no waiting out a retry (PICTURES_NOT_READY).
+        const key = `pool:${pool.pool}`;
+        const rec = given ? await d.store.get(key) : null;
+        if (rec?.retryAt) await d.store.put(key, { ...rec, retryAt: 0 });
+        continue;
+      }
+      if (t.status === 2 && !t.settled && d.chain.ordDelivered)
+        await okay(`take-out ${t.id} pictures out for good`, () =>
+          d.chain.ordDelivered!(pool.pool, t.id),
+        );
+    }
+    if (vs && vs.reveals > 0 && d.vault.reveal) {
+      try {
+        const r = await d.vault.reveal(pool.pool);
+        log(`${name}: batch ${r.batch} reveal ${r.state} ${r.txid}`);
+      } catch (e) {
+        const code = msg(e);
+        if (
+          !/^(COMMITS_NOT_CONFIRMED|LOGO_NOT_CONFIRMED|NOTHING_TO_REVEAL)/.test(
+            code,
+          )
+        )
+          log(`${name}: reveal: ${code}`);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * M129 the Ordinals shelf, one pool with a collection: its shelf address
+   * set once, where each reveal put its Ordinals recorded, Ordinals at the
+   * shelf sold back to the pool (never below their sellers' prices), those
+   * leaving the shelf sent by the vault, and every minted Ordinal followed
+   * on Bitcoin each time its coin is spent (proven; the program computes
+   * where it lands). Each Ordinal on its own: one failing never holds up
+   * the others.
+   */
+  async function shelf(pool: RelayerPool, tip: number, minConf: number) {
+    if (!d.chain.ordCoins) return;
+    const name = short(pool.pool);
+    const quiet = async (
+      what: string,
+      f: () => Promise<string>,
+      fine: RegExp,
+    ) => {
+      try {
+        log(`${name}: ${what} ${await f()}`);
+        return true;
+      } catch (e) {
+        const code = msg(e);
+        if (!fine.test(code)) log(`${name}: ${what}: ${code}`);
+        return false;
+      }
+    };
+    const skey = `shelf:${pool.pool}`;
+    const srec = (await d.store.get(skey)) ?? {};
+    if (
+      d.vault.setShelf &&
+      !srec.done &&
+      !(srec.retryAt && now() < srec.retryAt)
+    ) {
+      try {
+        log(`${name}: shelf address set ${await d.vault.setShelf(pool.pool)}`);
+        srec.done = true;
+      } catch (e) {
+        const code = msg(e);
+        if (/SHELF_SET/.test(code)) srec.done = true;
+        else {
+          srec.retryAt = now() + p.retrySeconds;
+          srec.lastError = code;
+          log(`${name}: shelf address: ${code}`);
+        }
+      }
+      await d.store.put(skey, srec);
+    }
+    const coins = await d.chain.ordCoins(pool.pool);
+    if (!coins.length) return;
+    // Sales to the pool: the coins the shelf's newest transactions spent
+    // are looked at this tick (their sellers are paid right after their
+    // confirmations, not on the round robin).
+    const fresh = new Set<string>();
+    if (srec.done && d.chain.shelfScript && d.bitcoin.scriptSpends)
+      try {
+        const script = await d.chain.shelfScript(pool.pool);
+        if (script)
+          for (const o of await d.bitcoin.scriptSpends(script))
+            fresh.add(`${o.txid}:${o.vout}`);
+      } catch (e) {
+        log(`${name}: the shelf's transactions: ${msg(e)}`);
+      }
+    if (d.vault.ordGenesis && coins.some((c) => c.state === OC_AWAITING))
+      await quiet(
+        'Ordinals recorded',
+        () => d.vault.ordGenesis!(pool.pool),
+        /^(NOTHING_TO_RECORD|WAITING_DELIVERED)/,
+      );
+    for (const c of coins) {
+      const n = `Ordinal #${c.item + 1}`;
+      if (c.state === OC_SELLING && c.party && d.chain.ordSellBack)
+        await quiet(
+          `${n} sold to the pool`,
+          () => d.chain.ordSellBack!(pool.pool, c.item, c.party!),
+          /BelowSellerMinimum|InsufficientLiquidity/,
+        );
+      if (c.state === OC_LEAVING && d.vault.shelfSend) {
+        const key = `ordsend:${pool.pool}:${c.item}`;
+        const rec = (await d.store.get(key)) ?? {};
+        try {
+          const s = await d.vault.shelfSend(pool.pool, c.item);
+          if (rec.txids?.[0] !== s.txid)
+            log(`${name}: ${n} leaving the shelf: ${s.state} ${s.txid}`);
+          await d.store.put(key, { txids: [s.txid] });
+        } catch (e) {
+          const code = msg(e);
+          if (!/^(NOT_LEAVING|COIN_NOT_CONFIRMED|FEES_TOO_HIGH)/.test(code))
+            log(`${name}: ${n} leaving the shelf: ${code}`);
+        }
+      }
+    }
+    if (!d.chain.ordFollow || !d.bitcoin.rawTx) return;
+    // Leaving ones and fresh sales first, then the rest in turn.
+    const first = (c: RelayerOrdCoin) =>
+      c.state === OC_LEAVING || fresh.has(`${c.txid}:${c.vout}`);
+    const watch = coins
+      .filter(
+        (c) =>
+          (c.state === OC_HELD || c.state === OC_LEAVING) &&
+          !/^0+$/.test(c.txid),
+      )
+      .sort((a, b) => Number(first(b)) - Number(first(a)));
+    let checks = 0;
+    for (const c of watch) {
+      const key = `ord:${pool.pool}:${c.item}`;
+      const rec = (await d.store.get(key)) ?? {};
+      if (rec.stuck && rec.txids?.[0] === c.txid) continue;
+      if (!first(c) && rec.retryAt && now() < rec.retryAt) continue;
+      if (checks++ >= p.ordChecksPerTick) break;
+      await d.store.put(key, { retryAt: now() + p.ordRecheckSeconds });
+      const s = await d.bitcoin.spender(c.txid, c.vout);
+      if (!s) continue;
+      if (s.height === null || tip - s.height + 1 < minConf) {
+        // Spent (a sale to the pool, say): looked at again each minute
+        // until it has its confirmations, so its seller is paid soon after.
+        await d.store.put(key, { retryAt: now() + p.ordSpentRecheckSeconds });
+        continue;
+      }
+      const proof = await d.bitcoin.prove(s.txid);
+      if (!proof) continue;
+      const ins = txBasics(proof.rawTx).inputs;
+      const input = ins.findIndex(
+        (i) => i.txid === c.txid && i.vout === c.vout,
+      );
+      if (input < 0) continue;
+      const stuck = async (why: string) => {
+        await d.store.put(key, {
+          stuck: true,
+          txids: [c.txid],
+          lastError: why,
+        });
+        log(
+          `${name}: Ordinal #${c.item + 1} cannot be followed through ${s.txid}: ${why}`,
+        );
+      };
+      if (input > MAX_INPUTS_BEFORE) {
+        await stuck(`${input} inputs before it`);
+        continue;
+      }
+      const prevs: Uint8Array[] = [];
+      let bytes = proof.rawTx.length;
+      for (const i of ins.slice(0, input)) {
+        const raw = await d.bitcoin.rawTx(i.txid);
+        bytes += raw.length;
+        prevs.push(raw);
+      }
+      if (bytes > p.ordFollowMaxBytes) {
+        await stuck(`a ${bytes}-byte proof`);
+        continue;
+      }
+      await quiet(
+        `Ordinal #${c.item + 1} followed through ${s.txid}`,
+        () => d.chain.ordFollow!(pool.pool, c.item, proof, input, prevs),
+        /OrdinalState/,
+      );
+    }
+  }
+
+  /** M123: the picture fee, like the withdrawal fee (only once a collection exists). */
+  async function ordFee() {
+    if (!d.vault.ordFee) return;
+    const key = 'ord-fee';
+    const rec = (await d.store.get(key)) ?? {};
+    if (rec.retryAt && now() < rec.retryAt) return;
+    await d.store.put(key, { retryAt: now() + p.withdrawalFeeSeconds });
+    try {
+      log(`picture fee set by the vault canister (${await d.vault.ordFee()})`);
+    } catch (e) {
+      const code = msg(e);
+      if (!/^(ORD_FEE_UNCHANGED|ORD_FEE_SET_RECENTLY)/.test(code))
+        log(`picture fee: ${code}`);
+    }
+  }
+
   async function tick() {
     let tip: number;
     try {
@@ -770,7 +1126,17 @@ export function createPoolRelayer(d: {
     }
     await withdrawalFee();
     const minConf = await d.chain.minConfirmations();
+    let collections = false;
     for (const pool of await d.chain.pools()) {
+      if ((await d.store.get(`pool:${pool.pool}`))?.ours === true)
+        try {
+          if (await ordinals(pool, tip)) {
+            collections = true;
+            await shelf(pool, tip, minConf);
+          }
+        } catch (e) {
+          log(`${short(pool.pool)}: ordinals: ${msg(e)}`);
+        }
       if ((await d.store.get(`pool:${pool.pool}`))?.ours === true)
         try {
           await deposits(pool, tip, minConf);
@@ -809,6 +1175,7 @@ export function createPoolRelayer(d: {
         );
       }
     }
+    if (collections) await ordFee();
   }
 
   return { tick, syncHeaders };

@@ -109,6 +109,38 @@ export function approveMessage(
   return `${what}\nApproval ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
 }
 
+/** M129 `ord_shelf` / `btc_shelf` actions. */
+export const SHELF_SELL = 0;
+export const SHELF_RETURN = 1;
+export const SHELF_BUY = 2;
+
+/**
+ * M129: what a Bitcoin wallet signs at a pool's Ordinals shelf
+ * (`rune_pool::shelf_message`): sell its Ordinal (collection index `item`)
+ * to the pool for at least `amount` sats, take it back unsold, or buy one
+ * from the pool for at most `amount` sats of its Etchy balance.
+ */
+export function shelfMessage(
+  network: PoolNetwork,
+  pool: RuneLabel,
+  action: number,
+  item: number,
+  amount: bigint,
+  nonce: bigint,
+  expiry: bigint,
+): string {
+  const h = head(network);
+  const n = item + 1;
+  const btc = formatUnits(amount, 8);
+  const what =
+    action === SHELF_SELL
+      ? `${h} sell my Ordinal #${n} of ${label(pool)} to the pool for at least ${btc} BTC.`
+      : action === SHELF_RETURN
+        ? `${h} send my Ordinal #${n} of ${label(pool)} back to the address it came from, unsold.`
+        : `${h} buy Ordinal #${n} of ${label(pool)} from the pool for at most ${btc} BTC of my Etchy balance, sent to my Ordinals address.`;
+  return `${what}\nOrder ${nonce}, valid until ${expiry} (unix time).${PROGRAM_LINE}`;
+}
+
 /** Moves WBTC out of a Bitcoin wallet's Etchy balance to a Solana wallet. */
 export function sendWbtcMessage(
   network: PoolNetwork,

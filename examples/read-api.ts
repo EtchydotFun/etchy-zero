@@ -5,11 +5,13 @@
  * wallet's balances and withdrawals, then live trades for 30 seconds.
  *
  *   node --experimental-strip-types examples/read-api.ts [Rune ID or name] [wallet]
+ *
+ * Mainnet (`https://api.etchy.fun/zero`); devnet: ETCHY_POOL_API=https://api.etchy.fun/rune-pools
  */
 import { createEtchyApi, formatUnits } from '../src/index.ts';
 
 const api = createEtchyApi(
-  process.env.ETCHY_POOL_API ?? 'https://api.etchy.fun/rune-pools',
+  process.env.ETCHY_POOL_API ?? 'https://api.etchy.fun/zero',
 );
 const which = process.argv[2] ?? '971505:1052';
 const wallet = process.argv[3];

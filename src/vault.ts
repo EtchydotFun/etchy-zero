@@ -56,6 +56,40 @@ const idl: IDL.InterfaceFactory = ({ IDL: I }) => {
     per_pool_per_hour: I.Nat32,
     per_hour: I.Nat32,
   });
+  const PictureArg = I.Record({
+    index: I.Nat16,
+    content_type: I.Text,
+    content: I.Vec(I.Nat8),
+    proof: I.Vec(I.Vec(I.Nat8)),
+  });
+  const RevealTx = I.Record({
+    pool: I.Text,
+    batch: I.Nat64,
+    txid: I.Text,
+    raw: I.Text,
+    pictures: I.Vec(I.Nat16),
+    takes: I.Vec(I.Nat64),
+    fee_sats: I.Nat64,
+    state: I.Text,
+  });
+  const OrdState = I.Record({
+    held: I.Vec(I.Nat64),
+    reveals: I.Vec(RevealTx),
+    logo: I.Opt(I.Text),
+    held_bytes: I.Nat64,
+  });
+  const ShelfTx = I.Record({
+    pool: I.Text,
+    item: I.Nat16,
+    txid: I.Text,
+    raw: I.Text,
+    fee_sats: I.Nat64,
+    state: I.Text,
+  });
+  const ShelfState = I.Record({
+    geneses: I.Vec(I.Record({ reveal: I.Text, items: I.Vec(I.Nat16) })),
+    sends: I.Vec(ShelfTx),
+  });
   const Status = I.Record({
     version: I.Text,
     paused: I.Bool,
@@ -92,8 +126,65 @@ const idl: IDL.InterfaceFactory = ({ IDL: I }) => {
     run_pay_batch: I.Func([I.Text], [R(BitcoinTx)], []),
     run_withdrawal_fee: I.Func([], [R(SolanaSent)], []),
     status: I.Func([], [Status], ['query']),
+    // M123 Ordinal Runes.
+    launch_ord_address: I.Func([I.Text], [R(AddressInfo)], []),
+    ord_address: I.Func([I.Text], [R(AddressInfo)], []),
+    ord_pictures: I.Func([I.Text, I.Nat64, I.Vec(PictureArg)], [R(I.Text)], []),
+    run_reveal: I.Func([I.Text], [R(RevealTx)], []),
+    run_ord_fee: I.Func([], [R(SolanaSent)], []),
+    ord_state: I.Func([I.Text], [OrdState], ['query']),
+    // M129 the Ordinals shelf.
+    shelf_address: I.Func([I.Text], [R(AddressInfo)], []),
+    run_set_shelf: I.Func([I.Text], [R(SolanaSent)], []),
+    run_ord_genesis: I.Func([I.Text], [R(SolanaSent)], []),
+    run_shelf_send: I.Func([I.Text, I.Nat16], [R(ShelfTx)], []),
+    shelf_state: I.Func([I.Text], [ShelfState], ['query']),
   });
 };
+
+/** M129: an Ordinal leaving the shelf, sent by the canister from its own coin. */
+export interface VaultShelfSend {
+  pool: string;
+  item: number;
+  /** Display order. */
+  txid: string;
+  raw: string;
+  fee_sats: bigint;
+  /** sent, confirmed (its coin is spent). */
+  state: string;
+}
+export interface VaultShelfState {
+  geneses: { reveal: string; items: number[] }[];
+  sends: VaultShelfSend[];
+}
+
+/** M123: one drawn picture handed to the canister, with its proof against the collection's root. */
+export interface VaultPicture {
+  index: number;
+  content_type: string;
+  content: Uint8Array | number[];
+  proof: (Uint8Array | number[])[];
+}
+/** M123: a batch's reveal (its pictures inscribed to their holders). */
+export interface VaultReveal {
+  pool: string;
+  batch: bigint;
+  /** Display order; empty until signed. */
+  txid: string;
+  raw: string;
+  /** Collection indexes, in output order (output J + 1). */
+  pictures: number[];
+  takes: bigint[];
+  fee_sats: bigint;
+  /** waiting (for the batch's block), sent, confirmed. */
+  state: string;
+}
+export interface VaultOrdState {
+  held: bigint[];
+  reveals: VaultReveal[];
+  logo: [] | [string];
+  held_bytes: bigint;
+}
 
 export interface VaultAddress {
   internal_key: string;
@@ -138,10 +229,11 @@ export class VaultError extends Error {
   }
 }
 
+/** The vault canister's client: mainnet's unless `canisterId` says otherwise (devnet: `DEVNET_VAULT_CANISTER`). */
 export async function createVaultCanister(
   o: { canisterId?: string; host?: string; identity?: Identity } = {},
 ) {
-  const canisterId = o.canisterId ?? DEVNET_VAULT_CANISTER;
+  const canisterId = o.canisterId ?? MAINNET_VAULT_CANISTER;
   const agent = await HttpAgent.create({
     host: o.host ?? ICP_HOST,
     identity: o.identity ?? new AnonymousIdentity(),
@@ -179,6 +271,48 @@ export async function createVaultCanister(
     runWithdrawalFee: async () =>
       ok<VaultSent>(await actor.run_withdrawal_fee()),
     status: async () => (await actor.status()) as VaultStatus,
+    // ---- M123 Ordinal Runes
+    /** Etch a collection's logo here (output 0), with its supply to `launchAddress`. */
+    launchOrdAddress: async (launchKeyHex: string) =>
+      ok<VaultAddress>(await actor.launch_ord_address(launchKeyHex)),
+    ordAddress: async (pool: string) =>
+      ok<VaultAddress>(await actor.ord_address(pool)),
+    /** A drawn take-out's pictures (checked against the collection's root): its batch may then go. */
+    ordPictures: async (pool: string, take: bigint, pictures: VaultPicture[]) =>
+      ok<string>(
+        await actor.ord_pictures(
+          pool,
+          take,
+          pictures.map((p) => ({
+            index: p.index,
+            content_type: p.content_type,
+            content: Uint8Array.from(p.content),
+            proof: p.proof.map((x) => Uint8Array.from(x)),
+          })),
+        ),
+      ),
+    /** The pool's oldest batch with pictures, once in a block: its reveal (the same one if asked again). */
+    runReveal: async (pool: string) =>
+      ok<VaultReveal>(await actor.run_reveal(pool)),
+    /** The program's picture fee from the Bitcoin fee rate now (`ORD_FEE_UNCHANGED` / `ORD_FEE_SET_RECENTLY` otherwise). */
+    runOrdFee: async () => ok<VaultSent>(await actor.run_ord_fee()),
+    ordState: async (pool: string) =>
+      (await actor.ord_state(pool)) as VaultOrdState,
+    // ---- M129 the Ordinals shelf
+    /** Where Ordinals are sold back to the pool (a key of this canister). */
+    shelfAddress: async (pool: string) =>
+      ok<VaultAddress>(await actor.shelf_address(pool)),
+    /** The program's `set_shelf` (once; `SHELF_SET` after). */
+    runSetShelf: async (pool: string) =>
+      ok<VaultSent>(await actor.run_set_shelf(pool)),
+    /** Where the canister's reveals put the pool's Ordinals, told to the program. */
+    runOrdGenesis: async (pool: string) =>
+      ok<VaultSent>(await actor.run_ord_genesis(pool)),
+    /** An Ordinal the program says leaves the shelf, sent from its own coin. */
+    runShelfSend: async (pool: string, item: number) =>
+      ok<VaultShelfSend>(await actor.run_shelf_send(pool, item)),
+    shelfState: async (pool: string) =>
+      (await actor.shelf_state(pool)) as VaultShelfState,
   };
 }
 export type VaultCanister = Awaited<ReturnType<typeof createVaultCanister>>;
@@ -194,5 +328,37 @@ export function keeperVault(v: VaultCanister): PoolRelayerVault {
       return { txid: b.txid, feeRate: Number(b.fee_rate), version: b.version };
     },
     withdrawalFee: async () => (await v.runWithdrawalFee()).signature,
+    // M123 Ordinal Runes.
+    async ordState(pool) {
+      const s = await v.ordState(pool);
+      return {
+        held: s.held,
+        revealing: s.reveals.flatMap((r) => r.takes),
+        reveals: s.reveals.length,
+      };
+    },
+    ordPictures: (pool, id, pictures) =>
+      v.ordPictures(
+        pool,
+        id,
+        pictures.map((p) => ({
+          index: p.index,
+          content_type: p.contentType,
+          content: p.content,
+          proof: p.proof,
+        })),
+      ),
+    async reveal(pool) {
+      const r = await v.runReveal(pool);
+      return { txid: r.txid, state: r.state, batch: r.batch };
+    },
+    ordFee: async () => (await v.runOrdFee()).signature,
+    // M129 the Ordinals shelf.
+    setShelf: async (pool) => (await v.runSetShelf(pool)).signature,
+    ordGenesis: async (pool) => (await v.runOrdGenesis(pool)).signature,
+    async shelfSend(pool, item) {
+      const s = await v.runShelfSend(pool, item);
+      return { txid: s.txid, state: s.state };
+    },
   };
 }
